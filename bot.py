@@ -20,6 +20,10 @@ PARENT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 HOLY_SCRIPTURE_TXT = PARENT_DIRECTORY + '/' + "HolyScripture.txt"
 USER_LEGEND_TXT = PARENT_DIRECTORY + '/' + "UserLegend.txt"
 MAX_NUMBER_OF_HOLY_LINES = 10
+ENOS_START_LINE_NUMBER = 102
+ENOS_NUMBER_OF_LINES = 13
+YEE_START_LINE_NUMBER = 195
+YEE_NUMBER_OF_LINES = 6
 
 client = discord.Client()
 
@@ -71,7 +75,7 @@ async def on_message(message):
         # The newline characters will be interpreted appropriately by the send() below
         holyScriptureReading = ''.join(holyScriptureLines[holyStart:holyStop])
         
-        await message.channel.send(holyScriptureReading + '\n' + 'This is the word of our lord.')
+        await message.channel.send('A reading from the Holy Text.'+ '\n' + holyScriptureReading + '\n' + 'This is the word of our Lord.')
         
     if message.content == '!legend' or message.content == '!Legend':
         # Read in the user legend and print it. Maybe make this fancier later.
@@ -80,5 +84,23 @@ async def on_message(message):
         userLegendFile.close()
         
         await message.channel.send(''.join(userLegendLines))
+    
+    if message.content == '!roles':
+        
+        # Read in the Holy Scripture and get the number of lines
+        holyScriptureFile = open(HOLY_SCRIPTURE_TXT, "r", encoding="utf8")
+        holyScriptureReading = ''.join(holyScriptureFile.readlines()[ENOS_START_LINE_NUMBER:(ENOS_START_LINE_NUMBER + ENOS_NUMBER_OF_LINES)])
+        holyScriptureFile.close()
+        
+        await message.channel.send(holyScriptureReading + '\n' + 'These are our sacred roles & duties, as given by our Lord.')
+        
+    if message.content == '!YEEE':
+        
+        # Read in the Holy Scripture and get the number of lines
+        holyScriptureFile = open(HOLY_SCRIPTURE_TXT, "r", encoding="utf8")
+        holyScriptureReading = ''.join(holyScriptureFile.readlines()[YEE_START_LINE_NUMBER:(YEE_START_LINE_NUMBER + YEE_NUMBER_OF_LINES)])
+        holyScriptureFile.close()
+        
+        await message.channel.send(holyScriptureReading + '\n' + 'Amen.')
         
 client.run(TOKEN)
