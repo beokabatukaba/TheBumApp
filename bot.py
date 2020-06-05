@@ -87,7 +87,7 @@ async def on_message(message):
     
     if message.content == '!roles':
         
-        # Read in the Holy Scripture and get the number of lines
+        # Read in the Holy Scripture pertaining to our roles
         holyScriptureFile = open(HOLY_SCRIPTURE_TXT, "r", encoding="utf8")
         holyScriptureReading = ''.join(holyScriptureFile.readlines()[ENOS_START_LINE_NUMBER:(ENOS_START_LINE_NUMBER + ENOS_NUMBER_OF_LINES)])
         holyScriptureFile.close()
@@ -96,7 +96,7 @@ async def on_message(message):
         
     if message.content == '!YEEE':
         
-        # Read in the Holy Scripture and get the number of lines
+        # Read in the Holy Scripture pertaining to YEE
         holyScriptureFile = open(HOLY_SCRIPTURE_TXT, "r", encoding="utf8")
         holyScriptureReading = ''.join(holyScriptureFile.readlines()[YEE_START_LINE_NUMBER:(YEE_START_LINE_NUMBER + YEE_NUMBER_OF_LINES)])
         holyScriptureFile.close()
