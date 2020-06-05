@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 bot.py
@@ -16,8 +17,8 @@ load_dotenv(verbose=True)
 TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD = os.getenv('DISCORD_GUILD')
 PARENT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
-HOLY_SCRIPTURE_TXT = PARENT_DIRECTORY + '\\' + "HolyScripture.txt"
-USER_LEGEND_TXT = PARENT_DIRECTORY + '\\' + "UserLegend.txt"
+HOLY_SCRIPTURE_TXT = PARENT_DIRECTORY + '/' + "HolyScripture.txt"
+USER_LEGEND_TXT = PARENT_DIRECTORY + '/' + "UserLegend.txt"
 MAX_NUMBER_OF_HOLY_LINES = 10
 
 client = discord.Client()
