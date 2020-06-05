@@ -75,7 +75,7 @@ async def on_message(message):
         # The newline characters will be interpreted appropriately by the send() below
         holyScriptureReading = ''.join(holyScriptureLines[holyStart:holyStop])
         
-        await message.channel.send('A reading from the Holy Text.'+ '\n' + holyScriptureReading + '\n' + 'This is the word of our Lord.')
+        await message.channel.send('A reading from the Holy Text.'+ '\n\n' + holyScriptureReading + '\n' + 'This is the word of our Lord.')
         
     if message.content == '!legend' or message.content == '!Legend':
         # Read in the user legend and print it. Maybe make this fancier later.
