@@ -103,4 +103,15 @@ async def on_message(message):
         
         await message.channel.send(holyScriptureReading + '\n' + 'Amen.')
         
+    if message.content == '!help' or message.content == '!Help' or message.content == '!commands' or message.content == '!list' or message.content == '!?':
+        listOfCommands = """
+        !YEE: Display a random snippet from our holy document.
+        !YEEE: Display the inspiration for the whole YEEEEEEEEEEEEEEEEEE thing.
+        !legend: Display the names of the actual humans(?) behind the masks.
+        !roles: Display the primary scriptural inspiration for our roles.
+        !help/!commands/!list/!?: Display this very message.
+        """
+        
+        await message.channel.send(''.join(listOfCommands))
+        
 client.run(TOKEN)
