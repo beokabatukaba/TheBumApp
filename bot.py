@@ -229,15 +229,16 @@ class YeeSpeech(commands.Cog):
         await channel.connect()
 
     @commands.command()
-    async def YEEe(self, ctx, *, query):
+    async def YEEe(self, ctx):
         """Plays a file from the local filesystem"""
-        tts = gTTS('A reading from the Holy Text.'+ '\n\n' + getYee() + '\n' + 'This is the word of our Lord.')
+        text = 'A reading from the Holy Text.'+ '\n\n' + getYee() + '\n' + 'This is the word of our Lord.'
+        tts = gTTS(text)
         file = './tmp.mp3'
         tts.save(file)
         source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(file))
         ctx.voice_client.play(source, after=lambda e: print('Player error: %s' % e) if e else None)
 
-        await ctx.send('Now playing: {}'.format(query))
+        await ctx.send(text)
 
     @commands.command()
     async def YEEvolume(self, ctx, volume: int):
