@@ -231,7 +231,7 @@ class YeeSpeech(commands.Cog):
     @commands.command()
     async def YEEe(self, ctx, *, query):
         """Plays a file from the local filesystem"""
-        tts = gTTS(getYee())
+        tts = gTTS('A reading from the Holy Text.'+ '\n\n' + getYee() + '\n' + 'This is the word of our Lord.')
         file = './tmp.mp3'
         tts.save(file)
         source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(file))
