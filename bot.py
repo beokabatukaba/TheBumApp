@@ -71,7 +71,7 @@ class YeeCommands(commands.Cog):
                 await bot.close()
         
     @commands.command()
-    async def scribble(self, ctx):            
+    async def YEE(self, ctx):            
         await ctx.channel.send('A reading from the Holy Text.'+ '\n\n' + getYee() + '\n' + 'This is the word of our Lord.')
         
     @commands.command()
