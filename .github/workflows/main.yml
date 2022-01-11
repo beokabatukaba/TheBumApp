@@ -25,16 +25,18 @@ jobs:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v2
 
-      # Runs a single command using the runners shell
-      # - name: Run a one-line script
-      #   run: docker build -t christotron:latest
+      - name: Build Christotron
+        run: docker build -t christotron:latest
 
-      - uses: docker/build-push-action@v2
-        with:
-          tags: christotron:latest
-          push: false
+      - name: Run Christotron
+        run: docker run christotron:latest
+        
+      # - uses: docker/build-push-action@v2
+      #   with:
+      #     tags: christotron:latest
+      #     push: false
 
-      - uses: addnab/docker-run-action@v3
-        with:
-          image: christotron:latest
+      # - uses: addnab/docker-run-action@v3
+      #   with:
+      #     image: christotron:latest
           # run: echo "hello world"
