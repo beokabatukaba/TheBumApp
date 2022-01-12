@@ -26,16 +26,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v2
 
-      - name: Build and Run Christotron
-        uses: ./
-        env:
+      - name: Check for previous containers
+        run: docker kill christotron
+
+      # - name: Build and Run Christotron
+      #   uses: ./
+      #   env:
+      #     DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+
+      - name: Build Christotron
+        run: docker build . -t christotron:latest
+
+      - name: Run Christotron
+        run: docker run --name christotron -v "/var/run/docker.sock":"/var/run/docker.sock" --rm -e DISCORD_TOKEN christotron:latest
+        env: 
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-
-      # - name: Build Christotron
-      #   run: docker build . -t christotron:latest
-
-      # - name: Run Christotron
-      #   run: docker run christotron:latest
 
       # - uses: docker/build-push-action@v2
       #   with:
