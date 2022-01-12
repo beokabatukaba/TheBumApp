@@ -12,5 +12,5 @@ description: 'Build and run Christotron'
 runs:
   using: 'docker'
   image: 'Dockerfile'
-  args:
-    - ${{ DOCKER_TOKEN }}
+  # args:
+  #   - ${{ DOCKER_TOKEN }}
