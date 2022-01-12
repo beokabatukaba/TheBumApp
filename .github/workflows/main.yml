@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@v2
 
       - name: Check for previous containers
-        run: docker kill christotron
+        run: docker kill christotron && 0
 
       # - name: Build and Run Christotron
       #   uses: ./
