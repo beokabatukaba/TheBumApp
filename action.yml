@@ -11,6 +11,6 @@ description: 'Build and run Christotron'
 #     description: 'The time we greeted you'
 runs:
   using: 'docker'
-  image: 'Dockerfile'
+  image: 'dockerfile'
   # args:
   #   - ${{ DOCKER_TOKEN }}
