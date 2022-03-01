@@ -254,7 +254,7 @@ class YeeSpeech(commands.Cog):
         print('Using language {}'.format(languages[language]))
         localization = random.choice(LOCALIZATIONS.split())
         print('Using localization {}'.format(localization))
-        tts = gTTS(text, lang='en', tld='ie')
+        tts = gTTS(text, lang='en', tld='co.uk')
         file = './tmp.mp3'
         tts.save(file)
         source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(file))
