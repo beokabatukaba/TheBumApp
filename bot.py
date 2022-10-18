@@ -14,8 +14,11 @@ import asyncio
 import youtube_dl
 from dotenv import load_dotenv
 from discord.ext import commands
+# from discord_slash import SlashCommand, SlashContext, cog_ext
+# import interactions
 from gtts import gTTS, lang
 from constants import *
+# import music
 
 load_dotenv(verbose=True)
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -30,7 +33,7 @@ class YeeCommands(commands.Cog):
         self.bot = bot
         
     async def on_ready(self, ctx):
-        print(f'{bot.user.name} has connected to Discord!')
+        print(f'{self.bot.user.name} has connected to Discord!')
 
     @commands.Cog.listener()
     async def on_member_join(self, member):
@@ -43,15 +46,15 @@ class YeeCommands(commands.Cog):
     async def on_message(self, message):
         print('Message received via ' + repr(message.channel) + ' of type ' + repr(message.channel.type))
         print(message.content)
-        if message.author == bot.user:
+        if message.author == self.bot.user:
             return
         
         if repr(message.channel.type).find('private') != -1:
             print('Private message received.')
             if message.content == 'logout':
                 print('Logging out.')
-                await bot.close()
-        
+                await self.bot.close()
+
     @commands.command()
     async def YEE(self, ctx):
         text = getYee()            
@@ -115,7 +118,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.url = data.get('url')
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False):
+    async def from_url(cls, ytdl, ffmpeg_options, url, *, loop=None, stream=False):
         loop = loop or asyncio.get_event_loop()
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
 
@@ -131,6 +134,9 @@ class Music(commands.Cog):
     def __init__(self, bot):
         print("Initializing Music class")
         self.bot = bot
+        ffmpeg_options, ytdl = initYoutubeDL()
+        self.ffmpeg_options = ffmpeg_options
+        self.ytdl = ytdl
 
     @commands.command()
     async def fancy(self, ctx):
@@ -160,7 +166,7 @@ class Music(commands.Cog):
         """Plays from a url (almost anything youtube_dl supports)"""
 
         async with ctx.typing():
-            player = await YTDLSource.from_url(url, loop=self.bot.loop)
+            player = await YTDLSource.from_url(self.ytdl, self.ffmpeg_options, url, loop=self.bot.loop)
             ctx.voice_client.play(player, after=lambda e: print('Player error: %s' % e) if e else None)
 
         await ctx.send('Now playing: {}'.format(player.title))
@@ -170,7 +176,7 @@ class Music(commands.Cog):
         """Streams from a url (same as yt, but doesn't predownload)"""
 
         async with ctx.typing():
-            player = await YTDLSource.from_url(url, loop=self.bot.loop, stream=True)
+            player = await YTDLSource.from_url(self.ytdl, url, self.ffmpeg_options, loop=self.bot.loop, stream=True)
             ctx.voice_client.play(player, after=lambda e: print('Player error: %s' % e) if e else None)
 
         await ctx.send('Now playing: {}'.format(player.title))
@@ -295,7 +301,7 @@ def initYoutubeDL():
     youtube_dl.utils.bug_reports_message = lambda: ''
     
     ytdl_format_options = {
-        'format': 'bestaudio/best',
+        'format': 'mp3/bestaudio/best',
         'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
         'restrictfilenames': True,
         'noplaylist': True,
@@ -364,13 +370,32 @@ def getYeee():
 
     return 'A reading of great glory from the Holy Text.' + '\n\n' + holyScriptureReading + '\n' + 'Amen.'  
 
-if __name__ == '__main__':
+async def load_extensions(bot):
+    await bot.add_cog(YeeCommands(bot))
+    # await bot.add_cog(Music(bot))
+    await bot.add_cog(YeeSpeech(bot))
+    await bot.load_extension("music")
+
+async def main():
+    intents = discord.Intents.default()
+    intents.message_content = True
     bot = commands.Bot(
+        intents = intents,
         command_prefix = commands.when_mentioned_or("!"),
         description = 'Praise be to our holy smut bot.'
     )
-    ffmpeg_options, ytdl = initYoutubeDL()
-    bot.add_cog(YeeCommands(bot))
-    bot.add_cog(Music(bot))
-    bot.add_cog(YeeSpeech(bot))
-    bot.run(TOKEN)
+    # bot = discord.Client(
+    #     intents = intents,
+    #     command_prefix = commands.when_mentioned_or("!"),
+    #     description = 'Praise be to our holy smut bot.'
+    # )
+    # bot.login(TOKEN)
+    # commandTree = discord.app_commands.CommandTree(bot)
+    # slash = SlashCommand(bot, sync_commands=True, sync_on_cog_reload=True)
+    async with bot:
+        await load_extensions(bot)
+        # await commandTree.sync(guild=GUILD)
+        await bot.start(TOKEN)
+        
+
+asyncio.run(main())

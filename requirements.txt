@@ -3,3 +3,4 @@ python-dotenv
 youtube_dl
 gtts
 PyNaCl
+discord-py-interactions
