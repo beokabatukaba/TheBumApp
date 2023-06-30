@@ -3,4 +3,5 @@
 tmp.mp3
 ffmpeg.exe
 bum-env
+bumvenv
 __pycache__
