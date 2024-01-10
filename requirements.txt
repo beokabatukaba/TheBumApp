@@ -6,3 +6,4 @@ PyNaCl
 # discord-py-interactions
 # tenacity
 watchgod
+replicate

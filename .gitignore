@@ -1,7 +1,9 @@
 .env
 *youtube*
-tmp.mp3
-ffmpeg.exe
+*.mp3
+*.jpg
+*.exe
+linbumvenv
 bum-env
 bumvenv
 __pycache__

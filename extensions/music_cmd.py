@@ -1,8 +1,12 @@
 import discord
+import asyncio
 from discord.ext import commands
 from discord import app_commands
 import youtube_dl
+# import yt_dlp
 import logging
+import subprocess
+from utils import to_thread
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Music_Commands(bot))
@@ -16,8 +20,10 @@ class Music_Commands(commands.Cog):
         self.song_queue = []
         self.YDL_OPTIONS = {'format': 'bestaudio', 'noplaylist':'True'}
         self.FFMPEG_OPTIONS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': '-vn'}
+        # self.FFMPEG_OPTIONS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5','options': '-vn -filter:a "volume=0.25"'}#optimised settings for ffmpeg for streaming
 
     def search_yt(self, item):
+        
         with youtube_dl.YoutubeDL(self.YDL_OPTIONS) as ydl:
             try:
                 info = ydl.extract_info(f"ytsearch:{item}", download=False)['entries'][0]
@@ -30,21 +36,40 @@ class Music_Commands(commands.Cog):
     #         # some analysis code here
     #         return 'copy', '96'
     
+    # @to_thread
     async def play_music(self):
+        
         self.is_playing = True
 
         while self.is_playing:
             if len(self.song_queue) > 0:
                 m_url = self.song_queue[0]['source']
                 self.song_queue.pop(0)
-                audio = await discord.FFmpegOpusAudio.from_probe(m_url, method='fallback')
-                
-                # audio = discord.FFmpegPCMAudio(m_url, **self.FFMPEG_OPTIONS)
-                self.voice.play(audio, after=lambda e: self.bot.loop.create_task(self.play_music()))
-                # self.voice.source = discord.PCMVolumeTransformer(self.voice.source)
-                
-                # self.voice.source.volume = 0.5
+                audio = await discord.FFmpegOpusAudio.from_probe(m_url, **self.FFMPEG_OPTIONS)#, method='fallback')
 
+                # video_id = m_url.split('=')[1]
+                # filename = f'{video_id}.mp3'
+                # subprocess.run(['yt-dlp', '-f', 'bestaudio', '-o', filename, m_url])
+                # audio = discord.FFmpegOpusAudio(filename)
+
+                # ydl_opts = {
+                #     'format': 'm4a/bestaudio/best',
+                #     # ℹ️ See help(yt_dlp.postprocessor) for a list of available Postprocessors and their arguments
+                #     'postprocessors': [{  # Extract audio using ffmpeg
+                #         'key': 'FFmpegExtractAudio',
+                #         'preferredcodec': 'm4a',
+                #     }]
+                # }
+                # with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                #     error_code = ydl.download(m_url)
+                # video_id = m_url.split('=')[1]
+                # filename = f'{video_id}.m4a'
+                # audio = discord.FFmpegOpusAudio(filename)
+
+                self.voice.play(audio, after=lambda e: self.bot.loop.create_task(self.play_music()))
+                # while self.voice.is_playing():
+                #     logging.info('is_playing')
+                #     await asyncio.sleep(1)
             else:
                 self.is_playing = False
 
@@ -74,7 +99,7 @@ class Music_Commands(commands.Cog):
             await ctx.channel.send("Could not download the song. Incorrect format try another keyword.")
             return
 
-        await ctx.channel.send(f"Added {song['title']} to the queue.")
+        await ctx.channel.send(f"Added {song['title']} to the queue.\n{url}")
         self.song_queue.append(song)
 
         if self.is_playing == False:
