@@ -1,0 +1,11 @@
+[Unit]
+Description=Christotron
+After=network.target
+
+[Service]
+User=christotron
+ExecStart=. /home/christotron/TheBumApp/.bumenv/bin/activate; python3 /home/christotron/TheBumApp/bot.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
