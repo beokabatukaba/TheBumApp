@@ -6,11 +6,12 @@ from utils import *
 from resources.constants import *
 
 PARENT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
-HOLY_SCRIPTURE_TXT = f"{PARENT_DIRECTORY}/resources/HolyScripture.txt"
-USER_LEGEND_TXT = f"{PARENT_DIRECTORY}/resources/UserLegend.txt"
+HOLY_SCRIPTURE_TXT = f"{PARENT_DIRECTORY}\\..\\resources\\HolyScripture.txt"
+USER_LEGEND_TXT = f"{PARENT_DIRECTORY}\\..\\resources\\UserLegend.txt"
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Text_Commands(bot))
+
 
 class Text_Commands(commands.Cog):
     def __init__(self, bot):

@@ -11,6 +11,7 @@ from utils import to_thread
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Music_Commands(bot))
 
+
 class Music_Commands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
