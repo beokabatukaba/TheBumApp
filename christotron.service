@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 User=christotron
-ExecStart=. /home/christotron/TheBumApp/.bumenv/bin/activate; python3 /home/christotron/TheBumApp/bot.py
+ExecStart="/home/christotron/TheBumApp/servicescript.sh"
 Restart=always
 
 [Install]
