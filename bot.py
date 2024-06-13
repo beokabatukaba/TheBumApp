@@ -19,6 +19,7 @@ import logging.handlers
 import ast
 import functools
 import typing
+import platform
 from discord.ext import commands
 from dotenv import load_dotenv
 from client import MyClient
@@ -79,9 +80,11 @@ async def watch_extensions():
 
 async def main():
     # Necessary for Linux I guess but not Windows
-    discord.opus.load_opus()
-    if not discord.opus.is_loaded():
-        raise RuntimeError('Opus failed to load')
+    if platform.system() != 'Windows':
+        # This might be the path with sudo apt install libopus-dev
+        discord.opus.load_opus('/usr/lib/x86_64-linux-gnu/libopus.so.0.9.0')
+        if not discord.opus.is_loaded():
+            raise RuntimeError('Opus failed to load')
     async with client:
         await asyncio.gather(start_bot(), watch_extensions())
 
