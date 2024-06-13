@@ -78,6 +78,10 @@ async def watch_extensions():
                 await reload_extension(path)
 
 async def main():
+    # Necessary for Linux I guess but not Windows
+    discord.opus.load_opus()
+    if not discord.opus.is_loaded():
+        raise RuntimeError('Opus failed to load')
     async with client:
         await asyncio.gather(start_bot(), watch_extensions())
 

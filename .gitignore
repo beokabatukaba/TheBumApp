@@ -8,3 +8,4 @@ linbumvenv
 bum-env
 bumvenv
 __pycache__
+.vscode
