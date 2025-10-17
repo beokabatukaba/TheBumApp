@@ -1,4 +1,4 @@
-discord.py
+discord.py @ git+https://github.com/Rapptz/discord.py.git@master
 python-dotenv
 youtube_dl
 gtts
@@ -7,3 +7,4 @@ PyNaCl
 # tenacity
 watchgod
 replicate
+numpy

@@ -87,3 +87,43 @@ def load_praise(text):
     logging.info('Loading source from buffer.')
     source = discord.FFmpegPCMAudio(file, pipe=True)
     return source
+
+@to_thread
+def get_piper_audio_source_rest(text: str,
+                          host: str = "127.0.0.1",
+                          port: int = 5000,
+                          endpoint: str = "/api/text-to-speech",
+                          voice: typing.Optional[str] = None) -> discord.FFmpegPCMAudio:
+    """Fetch synthesized audio from a Wyoming/Piper TTS HTTP server and return a Discord audio source.
+
+    Assumptions made (adjustable via parameters):
+    - The Piper server is reachable at http://{host}:{port}{endpoint}.
+    - The server accepts a JSON POST with at least a "text" field and optionally "voice".
+    - The server responds with raw audio bytes (wav/ogg/pcm). The handler will pass the bytes
+      to FFmpeg which will decode them for Discord playback.
+
+    If your Piper server uses a different HTTP contract (different path, query params or form encoding),
+    change the `endpoint` or replace the request body construction below.
+    """
+    import requests
+    url = f"http://{host}:{port}{endpoint}"
+    headers = {"accept": "audio/wav"}
+    # Remove literal newlines and collapse consecutive whitespace so the server
+    # receives a single-line text string. This replaces newlines, tabs, etc.
+    cleaned_text = ' '.join(text.split())
+    data = cleaned_text
+    if voice:
+        url += f"?voice={voice}"
+
+    logging.info(f"Requesting TTS from {url} with params {data}")
+    response = requests.post(url, headers=headers, data=data)
+    logging.info(f"Response status: {response.status_code}")
+    response.raise_for_status()
+    audio_bytes = response.content
+    logging.info(f"Received {len(audio_bytes)} bytes of audio data from TTS server.")
+
+    # Wrap bytes in a buffer and hand off to FFmpeg via pipe
+    file = io.BytesIO(audio_bytes)
+    file.seek(0)
+    source = discord.FFmpegPCMAudio(file, pipe=True)
+    return source

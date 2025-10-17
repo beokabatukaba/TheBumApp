@@ -10,3 +10,4 @@ bumvenv
 __pycache__
 .vscode
 .bumenv
+*.deb

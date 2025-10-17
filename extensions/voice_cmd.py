@@ -56,7 +56,8 @@ class Voice_Commands(commands.Cog):
         await interaction.response.send_message("Hear ye, hear ye, for this is the word of our lord.", ephemeral=True)
         async with interaction.channel.typing():
             text = getYee()
-            source = await load_praise(text)
+            # source = await load_praise(text)
+            source = await get_piper_audio_source_rest(text, voice="en_GB-semaine-medium")
         await interaction.channel.send(text)
         await self.speak_praise(interaction, source)
 
@@ -128,3 +129,6 @@ class Voice_Commands(commands.Cog):
         logging.info('Speaking praise...')
         if not voice_client.is_playing():
             voice_client.play(source, after=lambda e: logging.info('Player error: %s' % e) if e else None)
+
+
+            
