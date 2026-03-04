@@ -1,7 +1,13 @@
+import array
 import asyncio
 import io
 import logging
+import os
+import re
+import wave
 from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -11,15 +17,13 @@ from discord.opus import Decoder as OpusDecoder
 
 from wyoming_client import wyoming_tts, wyoming_stt
 
-import os
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 PIPER_HOST    = os.getenv("PIPER_HOST",   "127.0.0.1")
 PIPER_PORT    = int(os.getenv("PIPER_PORT",  "10200"))
-PIPER_VOICE   = os.getenv("PIPER_VOICE",  "en_GB-semaine-medium")
+PIPER_VOICE   = os.getenv("PIPER_VOICE",  "en_US-PordanJetersonMoM2017-ep595-medium")
 
 WHISPER_HOST  = os.getenv("WHISPER_HOST", "127.0.0.1")
 WHISPER_PORT  = int(os.getenv("WHISPER_PORT", "10300"))
@@ -27,10 +31,17 @@ WHISPER_LANG  = os.getenv("WHISPER_LANG", "en")  # set to "" to auto-detect
 
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",  "127.0.0.1")
 OLLAMA_PORT   = int(os.getenv("OLLAMA_PORT", "11434"))
-OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "gemma3")
+OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "gemma3:latest")
 
 # Seconds of silence that ends a speaking turn and triggers transcription
 SILENCE_THRESHOLD_S = float(os.getenv("SILENCE_THRESHOLD_S", "1.5"))
+
+# Minimum duration of audio (in seconds) before we even attempt STT.
+# At 48000 Hz / stereo / 16-bit, 1 second = 192000 bytes.
+# Clips shorter than this are almost always noise and cause hallucinations.
+MIN_AUDIO_SECONDS = float(os.getenv("MIN_AUDIO_SECONDS", "0.75"))
+_BYTES_PER_SECOND = 48000 * 2 * 2  # rate * channels * width
+MIN_PCM_BYTES = int(MIN_AUDIO_SECONDS * _BYTES_PER_SECOND)
 
 # Discord voice PCM format constants
 DISCORD_SAMPLE_RATE  = 48000
@@ -48,6 +59,84 @@ SYSTEM_PROMPT = os.getenv(
 )
 
 # ---------------------------------------------------------------------------
+# PCM endianness helper
+# ---------------------------------------------------------------------------
+# discord.opus.Decoder is a C extension wrapping libopus.  When you call
+# .decode() yourself (i.e. wants_opus=True), libopus returns 16-bit signed
+# PCM in **big-endian** (network) byte order.  WAV files and Whisper both
+# require **little-endian**.  The garbled/digital sound in the debug WAVs —
+# and the poor transcription quality — are both caused by this byte swap.
+#
+# We fix it once here, immediately after decode, so every downstream
+# consumer (buffer accumulation, WAV dump, Wyoming STT) gets correct LE PCM.
+
+def _be_to_le_pcm(pcm: bytes) -> bytes:
+    """Swap bytes of a big-endian 16-bit PCM buffer to little-endian."""
+    a = array.array("h", pcm)   # interpret as signed 16-bit (native)
+    a.byteswap()                # flip each sample's bytes
+    return bytes(a)
+
+
+# ---------------------------------------------------------------------------
+# Debug audio dumping
+# ---------------------------------------------------------------------------
+# Set AUDIO_DEBUG_DIR to a directory path to enable WAV dumping, e.g.:
+#   AUDIO_DEBUG_DIR=./debug_audio
+#
+# Each flushed utterance produces up to two files:
+#   <username>_<YYYYMMDD_HHMMSS_mmm>_prefilter.wav   — every clip, raw as received
+#   <username>_<YYYYMMDD_HHMMSS_mmm>_postfilter.wav  — only clips that pass the
+#                                                        MIN_PCM_BYTES length gate
+#                                                        (i.e. what Whisper actually sees)
+#
+# Both files are standard 48kHz / stereo / 16-bit little-endian WAV, playable
+# directly in VS Code or any media player.
+#
+# Leave AUDIO_DEBUG_DIR unset or empty to disable (default).
+
+_DEBUG_DIR_RAW = os.getenv("AUDIO_DEBUG_DIR", "")
+AUDIO_DEBUG_DIR: Path | None = Path(_DEBUG_DIR_RAW).resolve() if _DEBUG_DIR_RAW else None
+
+if AUDIO_DEBUG_DIR:
+    AUDIO_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    logging.info(f"[listen_cmd] Audio debug dump ENABLED → {AUDIO_DEBUG_DIR}")
+
+
+def _safe_username(name: str) -> str:
+    """Strip characters that are invalid in filenames."""
+    return re.sub(r"[^\w\-]", "_", name)
+
+
+def _dump_wav(pcm: bytes, username: str, label: str) -> None:
+    """
+    Write little-endian PCM to a WAV file in AUDIO_DEBUG_DIR.
+    No-ops silently if AUDIO_DEBUG_DIR is not set.
+
+    Args:
+        pcm:      Raw PCM bytes (48kHz, stereo, 16-bit signed little-endian).
+        username: Discord username — used in the filename.
+        label:    Short tag appended to the filename, e.g. "prefilter" or "postfilter".
+    """
+    if not AUDIO_DEBUG_DIR:
+        return
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_") + f"{datetime.now().microsecond // 1000:03d}"
+        filename = AUDIO_DEBUG_DIR / f"{_safe_username(username)}_{ts}_{label}.wav"
+        with wave.open(str(filename), "wb") as wf:
+            wf.setnchannels(DISCORD_CHANNELS)
+            wf.setsampwidth(DISCORD_SAMPLE_WIDTH)
+            wf.setframerate(DISCORD_SAMPLE_RATE)
+            wf.writeframes(pcm)
+        duration_s = len(pcm) / _BYTES_PER_SECOND
+        logging.debug(
+            f"[listen_cmd/debug] Wrote {label} WAV: {filename.name} "
+            f"({len(pcm):,} bytes / {duration_s:.2f}s)"
+        )
+    except Exception as e:
+        logging.warning(f"[listen_cmd/debug] Failed to dump WAV: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -59,19 +148,33 @@ def wav_to_discord_audio_source(wav_bytes: bytes) -> discord.FFmpegPCMAudio:
 
 
 async def query_llm(conversation_history: list) -> str | None:
-    """Send conversation history to Ollama /api/chat. Blocking call run in a thread."""
+    """Send conversation history to Ollama /api/chat. Blocking I/O run in a thread."""
     import requests
 
     def _call():
         url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/chat"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": conversation_history,
+            "stream": False,
+        }
         try:
-            resp = requests.post(
-                url,
-                json={"model": OLLAMA_MODEL, "messages": conversation_history, "stream": False},
-                timeout=60,
-            )
+            resp = requests.post(url, json=payload, timeout=60)
+            if resp.status_code == 404:
+                logging.error(
+                    f"[listen_cmd] Ollama returned 404 for model '{OLLAMA_MODEL}'. "
+                    f"Run `ollama list` to check available models, or set the "
+                    f"OLLAMA_MODEL env var to the correct name (e.g. 'gemma3:latest')."
+                )
+                return None
             resp.raise_for_status()
             return resp.json()["message"]["content"].strip()
+        except requests.exceptions.ConnectionError:
+            logging.error(
+                f"[listen_cmd] Cannot reach Ollama at {OLLAMA_HOST}:{OLLAMA_PORT}. "
+                f"Is Ollama running?"
+            )
+            return None
         except Exception as e:
             logging.error(f"[listen_cmd] Ollama request failed: {e}")
             return None
@@ -87,8 +190,9 @@ class ConversationSink(voice_recv.AudioSink):
     """
     Receives raw Opus payloads (wants_opus=True bypasses voice_recv's built-in
     decoder, which crashes on comfort-noise packets). Decodes per-user with
-    our own OpusDecoder instances, accumulates PCM, and fires an async callback
-    after SILENCE_THRESHOLD_S seconds of quiet from a given user.
+    our own OpusDecoder instances, byte-swaps to little-endian, accumulates
+    PCM, and fires an async callback after SILENCE_THRESHOLD_S seconds of
+    quiet from a given user.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop, callback):
@@ -119,7 +223,11 @@ class ConversationSink(voice_recv.AudioSink):
 
         uid = user.id
         try:
-            pcm = self._get_decoder(uid).decode(opus_bytes, fec=False)
+            # libopus decode() returns big-endian 16-bit PCM when called
+            # directly (wants_opus=True path).  Swap to little-endian so
+            # WAV files and Whisper both receive correctly ordered samples.
+            pcm_be = self._get_decoder(uid).decode(opus_bytes, fec=False)
+            pcm = _be_to_le_pcm(pcm_be)
         except Exception as e:
             logging.debug(f"[listen_cmd] Opus decode error from {getattr(user, 'name', uid)}: {e}")
             return
@@ -184,7 +292,22 @@ class Listen_Commands(commands.Cog):
         username = getattr(user, "name", str(user))
         logging.info(f"[listen_cmd] Processing {len(pcm)} PCM bytes from {username}.")
 
-        # 1. Transcribe — pass raw PCM directly, wyoming_stt handles the framing
+        # Debug dump — always write the raw clip first so you can hear exactly
+        # what arrived from Discord, before any filtering is applied.
+        _dump_wav(pcm, username, "prefilter")
+
+        # Gate: drop clips that are too short to contain real speech.
+        if len(pcm) < MIN_PCM_BYTES:
+            logging.info(
+                f"[listen_cmd] Clip from {username} is too short "
+                f"({len(pcm):,} < {MIN_PCM_BYTES:,} bytes / {MIN_AUDIO_SECONDS}s), skipping."
+            )
+            return
+
+        # Debug dump — write the clip that actually reaches Whisper.
+        _dump_wav(pcm, username, "postfilter")
+
+        # 1. Transcribe
         try:
             transcript = await wyoming_stt(
                 pcm,
@@ -202,6 +325,7 @@ class Listen_Commands(commands.Cog):
         if not transcript:
             logging.info(f"[listen_cmd] Empty transcript from {username}, ignoring.")
             return
+
         logging.info(f"[listen_cmd] {username}: {transcript!r}")
 
         if self._text_channel:
@@ -287,9 +411,10 @@ class Listen_Commands(commands.Cog):
         self.sink = ConversationSink(self.bot.loop, self._handle_audio)
         vc.listen(self.sink)
 
+        debug_note = f" | 🎙️ Dumping audio → `{AUDIO_DEBUG_DIR}`" if AUDIO_DEBUG_DIR else ""
         await interaction.channel.send(
             f"👂 Christotron is now listening in **{vc.channel.name}**. "
-            f"Speak thy piece — model: `{OLLAMA_MODEL}`."
+            f"Speak thy piece — model: `{OLLAMA_MODEL}`.{debug_note}"
         )
 
     @app_commands.command(name="unlisten", description="Stop listening and leave the voice channel")

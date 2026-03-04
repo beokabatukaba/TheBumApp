@@ -23,10 +23,56 @@ import asyncio
 import io
 import json
 import logging
+import re
 import wave
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Hallucination filter
+# ---------------------------------------------------------------------------
+# faster-whisper (especially tiny/small models) commonly hallucinates these
+# phrases on silence, background noise, or very short clips.  Any transcript
+# that matches one of these patterns (case-insensitive, stripped) is treated
+# as if nothing was said.
+_HALLUCINATION_PATTERNS: list[re.Pattern] = [
+    re.compile(r, re.IGNORECASE) for r in [
+        r"^thanks? for watching[.!]*$",
+        r"^please (like|subscribe|share)[.!]*$",
+        r"^(like and )?subscribe[.!]*$",
+        r"^\.{2,}$",                        # only dots/ellipsis
+        r"^\s*$",                           # blank
+        r"^\[[\w\s]+\]$",                  # [BLANK_AUDIO], [Music], etc.
+        r"^(uh+|um+|ah+|hmm+)[.!,]*$",    # single filler words
+        r"^you$",                           # lone "you" — common hallucination
+        r"^www\.",                          # URL fragments
+        r"^subtitles? by",
+        r"^transcribed by",
+        r"^captioned by",
+        r"^the end\.?$",
+    ]
+]
+
+# If faster-whisper reports no_speech_prob above this, discard the transcript.
+# The server embeds this in the transcript event's data dict.
+_NO_SPEECH_PROB_THRESHOLD = 0.60
+
+
+def _is_hallucination(text: str, no_speech_prob: float = 0.0) -> bool:
+    """Return True if the transcript should be discarded as a hallucination."""
+    if no_speech_prob >= _NO_SPEECH_PROB_THRESHOLD:
+        log.debug(
+            f"[wyoming/stt] Discarding transcript — no_speech_prob={no_speech_prob:.3f} "
+            f">= threshold {_NO_SPEECH_PROB_THRESHOLD}"
+        )
+        return True
+    stripped = text.strip()
+    for pattern in _HALLUCINATION_PATTERNS:
+        if pattern.search(stripped):
+            log.debug(f"[wyoming/stt] Discarding hallucination: {text!r}")
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +198,6 @@ async def wyoming_tts(
             log.debug(f"[wyoming/tts] Event: {etype!r}  data={edata}  payload_len={len(payload)}")
 
             if etype == "audio-start":
-                # This is where Piper declares the audio format
                 audio_rate     = edata.get("rate",     audio_rate)
                 audio_width    = edata.get("width",    audio_width)
                 audio_channels = edata.get("channels", audio_channels)
@@ -213,6 +258,9 @@ async def wyoming_stt(
     Takes raw PCM directly — no WAV container needed.
     Discord audio is 48000 Hz, stereo, 16-bit signed PCM.
 
+    Hallucination filtering is applied: transcripts that match known
+    false-positive patterns or have a high no_speech_prob are discarded.
+
     Args:
         pcm:      Raw PCM bytes.
         host:     Wyoming STT host.
@@ -258,8 +306,6 @@ async def wyoming_stt(
         log.debug("[wyoming/stt] Sent audio-stop, waiting for transcript...")
 
         # 5. Wait for transcript or error
-        # Different Wyoming STT implementations use different event names —
-        # we handle all known variants.
         transcript: Optional[str] = None
         while True:
             event = await _read_event(reader)
@@ -272,10 +318,19 @@ async def wyoming_stt(
             log.debug(f"[wyoming/stt] Event: {etype!r}  data={edata}")
 
             if etype in ("transcript", "stt-result"):
-                # "transcript" — wyoming-faster-whisper standard
-                # "stt-result"  — used by some older/alternate implementations
-                transcript = edata.get("text", "").strip() or None
-                log.debug(f"[wyoming/stt] Transcript: {transcript!r}")
+                raw_text = edata.get("text", "").strip()
+                # Pull no_speech_prob if the server includes it (some builds do)
+                no_speech_prob = float(edata.get("no_speech_prob", 0.0))
+
+                log.debug(
+                    f"[wyoming/stt] Raw transcript: {raw_text!r}  "
+                    f"no_speech_prob={no_speech_prob:.3f}"
+                )
+
+                if raw_text and not _is_hallucination(raw_text, no_speech_prob):
+                    transcript = raw_text
+                else:
+                    transcript = None
                 break
 
             elif etype == "error":
