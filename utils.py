@@ -50,6 +50,8 @@ def getYee():
     # Join the list into a single string, inserting empty characters between each element
     # The newline characters will be interpreted appropriately by the send() below
     holyScriptureReading = ''.join(holyScriptureLines[holyStart:holyStop])
+
+    # holyScriptureReading = holyScriptureReading.replace('.', '!')
     
     return 'A reading from the Holy Text.' + '\n\n' + holyScriptureReading + '\n' + 'This is the word of our Lord.'  
 
@@ -127,3 +129,73 @@ def get_piper_audio_source_rest(text: str,
     file.seek(0)
     source = discord.FFmpegPCMAudio(file, pipe=True)
     return source
+
+async def send_chunked_message(channel: discord.TextChannel, text: str, max_length: int = 2000) -> list:
+    """
+    Sends a message to a text channel, splitting it into multiple messages if it exceeds max_length.
+    
+    Args:
+        channel: The Discord text channel to send messages to
+        text: The text content to send
+        max_length: Maximum length per message (default 2000, Discord's limit)
+    
+    Returns:
+        A list of Message objects that were sent
+    
+    Raises:
+        discord.errors.HTTPException: If the message cannot be sent
+    """
+    sent_messages = []
+    
+    # If the message fits in one chunk, send it directly
+    if len(text) <= max_length:
+        sent_messages.append(await channel.send(text))
+        return sent_messages
+    
+    # Split the message into chunks
+    chunks = []
+    current_chunk = ""
+    
+    # Split by newlines first to preserve formatting
+    lines = text.split('\n')
+    
+    for line in lines:
+        # If a single line exceeds max_length, split it by spaces
+        if len(current_chunk) + len(line) + 1 > max_length:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            
+            # Handle lines longer than max_length
+            if len(line) > max_length:
+                words = line.split(' ')
+                temp_chunk = ""
+                for word in words:
+                    if len(temp_chunk) + len(word) + 1 > max_length:
+                        if temp_chunk:
+                            chunks.append(temp_chunk)
+                        temp_chunk = word
+                    else:
+                        if temp_chunk:
+                            temp_chunk += " " + word
+                        else:
+                            temp_chunk = word
+                if temp_chunk:
+                    chunks.append(temp_chunk)
+            else:
+                current_chunk = line
+        else:
+            if current_chunk:
+                current_chunk += "\n" + line
+            else:
+                current_chunk = line
+    
+    # Add the last chunk
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    # Send all chunks
+    for chunk in chunks:
+        sent_messages.append(await channel.send(chunk))
+    
+    return sent_messages

@@ -6,6 +6,11 @@ from discord.ext import commands
 from utils import *
 from resources.constants import *
 
+VOICE_NAME = "en_US-PordanJetersonMoM2017-ep595-medium"
+# VOICE_NAME = "en_US-PordanJetersonMoM2017Epoch3-medium"
+# VOICE_NAME = "en_US-pordanjeterson-medium"
+
+
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Voice_Commands(bot))
 
@@ -36,8 +41,9 @@ class Voice_Commands(commands.Cog):
         await interaction.response.send_message("Have mercy on Shem.", ephemeral=True)
         async with interaction.channel.typing():
             text = getShem()
-            source = await load_praise(text)
-        await interaction.channel.send(text)
+            # source = await load_praise(text)
+            source = await get_piper_audio_source_rest(text, voice=VOICE_NAME)
+        await send_chunked_message(interaction.channel, text)
         await self.speak_praise(interaction, source)
         
     @app_commands.command(name = "shemme", description = "My first application Command")
@@ -46,19 +52,21 @@ class Voice_Commands(commands.Cog):
         await interaction.response.send_message("Have mercy on Shem.", ephemeral=True)
         async with interaction.channel.typing():
             text = getShemm()
-            source = await load_praise(text)
-        await interaction.channel.send(text)
+            # source = await load_praise(text)
+            source = await get_piper_audio_source_rest(text, voice=VOICE_NAME)
+        await send_chunked_message(interaction.channel, text)
         await self.speak_praise(interaction, source)
 
     @app_commands.command(name="yee_e", description="My first application Command")
     async def yee_e(self, interaction: discord.Interaction):
         """Plays a file from the local filesystem"""
-        await interaction.response.send_message("Hear ye, hear ye, for this is the word of our lord.", ephemeral=True)
+        await interaction.response.send_message("Hear ye, hear ye, for this is the word of our lord.\nUsing voice: " + VOICE_NAME, ephemeral=True)
         async with interaction.channel.typing():
             text = getYee()
             # source = await load_praise(text)
-            source = await get_piper_audio_source_rest(text, voice="en_GB-semaine-medium")
-        await interaction.channel.send(text)
+            # source = await get_piper_audio_source_rest(text, voice="") #en_GB-semaine-medium
+            source = await get_piper_audio_source_rest(text, voice=VOICE_NAME)
+        await send_chunked_message(interaction.channel, text)
         await self.speak_praise(interaction, source)
 
     @app_commands.command(name = "yeee_e", description = "My first application Command")
@@ -67,8 +75,9 @@ class Voice_Commands(commands.Cog):
         await interaction.response.send_message("Open your ears for the sacred progenitor scripture.", ephemeral=True)
         async with interaction.channel.typing():
             text = getYeee()
-            source = await load_praise(text)
-        await interaction.channel.send(text)
+            # source = await load_praise(text)
+            source = await get_piper_audio_source_rest(text, voice=VOICE_NAME)
+        await send_chunked_message(interaction.channel, text)
         await self.speak_praise(interaction, source)
         
     @app_commands.command(name = "yeevolume", description = "My first application Command")
@@ -88,6 +97,18 @@ class Voice_Commands(commands.Cog):
         if interaction.client.voice_clients:
             logging.info('Discovered existing voice client. Stopping.')
             interaction.client.voice_clients[0].stop()
+
+    @app_commands.command(name="bee_e", description="My first application Command")
+    async def bee_e(self, interaction: discord.Interaction, text: str):
+        """Takes a user's input and plays it as speech in a voice channel"""
+        await interaction.response.send_message("Fine, I guess I'll say your dumb shit.", ephemeral=True)
+        async with interaction.channel.typing():
+            # text = getYee()
+            # source = await load_praise(text)
+            # source = await get_piper_audio_source_rest(text, voice="") #en_GB-semaine-medium
+            source = await get_piper_audio_source_rest(text, voice=VOICE_NAME)
+        await send_chunked_message(interaction.channel, text)
+        await self.speak_praise(interaction, source)
 
     # @app_commands.command(name = "stop", description = "My first application Command")
     # async def stop(self, interaction: discord.Interaction):
@@ -127,6 +148,7 @@ class Voice_Commands(commands.Cog):
         logging.info('Joining voice channel...')
         voice_client = await self.yeejoin(interaction)
         logging.info('Speaking praise...')
+        
         if not voice_client.is_playing():
             voice_client.play(source, after=lambda e: logging.info('Player error: %s' % e) if e else None)
 
