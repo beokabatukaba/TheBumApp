@@ -8,3 +8,5 @@ PyNaCl
 watchgod
 replicate
 numpy
+davey
+requests
