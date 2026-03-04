@@ -84,4 +84,35 @@ class Text_Commands(commands.Cog):
             text = getShemm()
         await interaction.response.send_message('Wow you are so cool! ありがとう、パパ。', ephemeral=True)
         await interaction.channel.send(text)
+
+    @app_commands.command(name = "postatoe", description = "Post a provided message to a named text channel")
+    async def postto(self, interaction: discord.Interaction, channel_name: str, message: str):
+        """Post `message` to the text channel with name `channel_name` in this guild.
+
+        The command finds the first text channel matching `channel_name` (case-sensitive),
+        sends the provided message there, and responds ephemerally to the invoker with status.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        if interaction.guild is None:
+            await interaction.followup.send('This command must be used in a server (guild).', ephemeral=True)
+            return
+
+        # Find text channel by name
+        target = discord.utils.get(interaction.guild.text_channels, name=channel_name)
+        if target is None:
+            await interaction.followup.send(f'Could not find a text channel named `{channel_name}`.', ephemeral=True)
+            return
+
+        try:
+            async with target.typing():
+                await target.send(message)
+        except discord.Forbidden:
+            await interaction.followup.send('I do not have permission to send messages to that channel.', ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f'Failed to send message: {e}', ephemeral=True)
+            return
+
+        await interaction.followup.send(f'Message posted to #{channel_name}.', ephemeral=True)
     
