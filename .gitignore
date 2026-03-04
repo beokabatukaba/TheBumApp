@@ -3,7 +3,7 @@
 *.mp3
 *.jpg
 *.exe
-logs
+logs/
 linbumvenv
 bum-env
 bumvenv
