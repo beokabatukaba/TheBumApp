@@ -1,4 +1,5 @@
 discord.py @ git+https://github.com/Rapptz/discord.py.git@master
+discord-ext-voice-recv @ git+https://github.com/imayhaveborkedit/discord-ext-voice-recv@main
 python-dotenv
 youtube_dl
 gtts

@@ -1,43 +1,42 @@
 import asyncio
 import io
 import logging
-import time
-import wave
 from collections import defaultdict
 
 import discord
-import requests
 from discord import app_commands
 from discord.ext import commands
+from discord.ext import voice_recv
+from discord.opus import Decoder as OpusDecoder
 
-from utils import get_piper_audio_source_rest
+from wyoming_client import wyoming_tts, wyoming_stt
 
-# ---------------------------------------------------------------------------
-# Configuration — override via environment variables or edit here directly
-# ---------------------------------------------------------------------------
 import os
 
-WHISPER_HOST   = os.getenv("WHISPER_HOST",  "127.0.0.1")
-WHISPER_PORT   = int(os.getenv("WHISPER_PORT", "9000"))
-WHISPER_ENDPOINT = os.getenv("WHISPER_ENDPOINT", "/inference")   # whisper.cpp server default
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-OLLAMA_HOST    = os.getenv("OLLAMA_HOST",   "127.0.0.1")
-OLLAMA_PORT    = int(os.getenv("OLLAMA_PORT", "11434"))
-OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL",  "llama3")
+PIPER_HOST    = os.getenv("PIPER_HOST",   "127.0.0.1")
+PIPER_PORT    = int(os.getenv("PIPER_PORT",  "10200"))
+PIPER_VOICE   = os.getenv("PIPER_VOICE",  "en_GB-semaine-medium")
 
-PIPER_HOST     = os.getenv("PIPER_HOST",    "127.0.0.1")
-PIPER_PORT     = int(os.getenv("PIPER_PORT", "5000"))
-PIPER_VOICE    = os.getenv("PIPER_VOICE",   "en_GB-semaine-medium")
+WHISPER_HOST  = os.getenv("WHISPER_HOST", "127.0.0.1")
+WHISPER_PORT  = int(os.getenv("WHISPER_PORT", "10300"))
+WHISPER_LANG  = os.getenv("WHISPER_LANG", "en")  # set to "" to auto-detect
 
-# How long (seconds) of silence ends a "turn" and triggers transcription
+OLLAMA_HOST   = os.getenv("OLLAMA_HOST",  "127.0.0.1")
+OLLAMA_PORT   = int(os.getenv("OLLAMA_PORT", "11434"))
+OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "gemma3")
+
+# Seconds of silence that ends a speaking turn and triggers transcription
 SILENCE_THRESHOLD_S = float(os.getenv("SILENCE_THRESHOLD_S", "1.5"))
 
-# Discord voice receives 48 kHz stereo 16-bit PCM
-DISCORD_SAMPLE_RATE = 48000
-DISCORD_CHANNELS    = 2
-DISCORD_SAMPLE_WIDTH = 2  # bytes (int16)
+# Discord voice PCM format constants
+DISCORD_SAMPLE_RATE  = 48000
+DISCORD_CHANNELS     = 2
+DISCORD_SAMPLE_WIDTH = 2  # bytes (16-bit)
 
-# Personality prompt — edit freely
 SYSTEM_PROMPT = os.getenv(
     "BOT_SYSTEM_PROMPT",
     (
@@ -49,102 +48,114 @@ SYSTEM_PROMPT = os.getenv(
 )
 
 # ---------------------------------------------------------------------------
-# Audio sink — accumulates PCM per user, fires a callback on silence
-# ---------------------------------------------------------------------------
-
-class VoiceSink(discord.AudioSink):
-    """Collects raw PCM audio per user and fires an async callback when a
-    speaker goes quiet for SILENCE_THRESHOLD_S seconds."""
-
-    def __init__(self, callback):
-        super().__init__()
-        # callback: async def callback(user_id: int, pcm_bytes: bytes)
-        self._callback = callback
-        self._buffers: dict[int, bytearray] = defaultdict(bytearray)
-        self._last_heard: dict[int, float] = {}
-        self._flush_tasks: dict[int, asyncio.Task] = {}
-
-    def write(self, user: discord.User, data: discord.AudioFrame):
-        uid = user.id
-        self._buffers[uid].extend(data.data)
-        self._last_heard[uid] = time.monotonic()
-
-        # (Re)start a flush timer each time we get audio
-        if uid in self._flush_tasks and not self._flush_tasks[uid].done():
-            self._flush_tasks[uid].cancel()
-        self._flush_tasks[uid] = asyncio.get_event_loop().create_task(
-            self._flush_after_silence(uid)
-        )
-
-    async def _flush_after_silence(self, uid: int):
-        await asyncio.sleep(SILENCE_THRESHOLD_S)
-        buf = bytes(self._buffers.pop(uid, b""))
-        self._last_heard.pop(uid, None)
-        if buf:
-            await self._callback(uid, buf)
-
-    def cleanup(self):
-        for task in self._flush_tasks.values():
-            task.cancel()
-        self._buffers.clear()
-        self._last_heard.clear()
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def pcm_to_wav(pcm: bytes,
-               sample_rate: int = DISCORD_SAMPLE_RATE,
-               channels: int = DISCORD_CHANNELS,
-               sample_width: int = DISCORD_SAMPLE_WIDTH) -> bytes:
-    """Wrap raw PCM bytes in a WAV container."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(sample_width)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm)
+def wav_to_discord_audio_source(wav_bytes: bytes) -> discord.FFmpegPCMAudio:
+    """Pipe WAV bytes (from wyoming_tts) into FFmpegPCMAudio for Discord playback."""
+    buf = io.BytesIO(wav_bytes)
     buf.seek(0)
-    return buf.read()
+    return discord.FFmpegPCMAudio(buf, pipe=True)
 
 
-def transcribe(wav_bytes: bytes) -> str | None:
-    """Send WAV audio to a local whisper.cpp HTTP server and return the transcript."""
-    url = f"http://{WHISPER_HOST}:{WHISPER_PORT}{WHISPER_ENDPOINT}"
-    try:
-        resp = requests.post(
-            url,
-            files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-            data={"response_format": "json"},
-            timeout=30,
+async def query_llm(conversation_history: list) -> str | None:
+    """Send conversation history to Ollama /api/chat. Blocking call run in a thread."""
+    import requests
+
+    def _call():
+        url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/chat"
+        try:
+            resp = requests.post(
+                url,
+                json={"model": OLLAMA_MODEL, "messages": conversation_history, "stream": False},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            return resp.json()["message"]["content"].strip()
+        except Exception as e:
+            logging.error(f"[listen_cmd] Ollama request failed: {e}")
+            return None
+
+    return await asyncio.to_thread(_call)
+
+
+# ---------------------------------------------------------------------------
+# AudioSink
+# ---------------------------------------------------------------------------
+
+class ConversationSink(voice_recv.AudioSink):
+    """
+    Receives raw Opus payloads (wants_opus=True bypasses voice_recv's built-in
+    decoder, which crashes on comfort-noise packets). Decodes per-user with
+    our own OpusDecoder instances, accumulates PCM, and fires an async callback
+    after SILENCE_THRESHOLD_S seconds of quiet from a given user.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, callback):
+        super().__init__()
+        self._loop = loop
+        self._callback = callback  # async def callback(user, pcm: bytes)
+        self._decoders:      dict[int, OpusDecoder]         = {}
+        self._buffers:       dict[int, bytearray]           = defaultdict(bytearray)
+        self._flush_handles: dict[int, asyncio.TimerHandle] = {}
+
+    def wants_opus(self) -> bool:
+        return True
+
+    def _get_decoder(self, uid: int) -> OpusDecoder:
+        if uid not in self._decoders:
+            self._decoders[uid] = OpusDecoder()
+        return self._decoders[uid]
+
+    def write(self, user, data: voice_recv.VoiceData) -> None:
+        if user is None:
+            return
+        if data.packet.is_silence():
+            return
+
+        opus_bytes = data.opus
+        if not opus_bytes:
+            return
+
+        uid = user.id
+        try:
+            pcm = self._get_decoder(uid).decode(opus_bytes, fec=False)
+        except Exception as e:
+            logging.debug(f"[listen_cmd] Opus decode error from {getattr(user, 'name', uid)}: {e}")
+            return
+
+        self._buffers[uid].extend(pcm)
+
+        handle = self._flush_handles.get(uid)
+        if handle is not None:
+            handle.cancel()
+        self._flush_handles[uid] = self._loop.call_later(
+            SILENCE_THRESHOLD_S, self._do_flush, uid, user
         )
-        resp.raise_for_status()
-        data = resp.json()
-        # whisper.cpp server returns {"text": "..."}
-        text = data.get("text", "").strip()
-        return text or None
-    except Exception as e:
-        logging.error(f"[listen_cmd] Whisper transcription failed: {e}")
-        return None
 
+    def _do_flush(self, uid: int, user) -> None:
+        pcm = bytes(self._buffers.pop(uid, b""))
+        self._flush_handles.pop(uid, None)
+        if pcm:
+            asyncio.ensure_future(self._callback(user, pcm), loop=self._loop)
 
-def query_llm(conversation_history: list[dict]) -> str | None:
-    """Send conversation history to Ollama and return the assistant reply."""
-    url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/chat"
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": conversation_history,
-        "stream": False,
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["message"]["content"].strip()
-    except Exception as e:
-        logging.error(f"[listen_cmd] Ollama request failed: {e}")
-        return None
+    @voice_recv.AudioSink.listener()
+    def on_voice_member_disconnect(self, member: discord.Member, ssrc) -> None:
+        uid = member.id
+        handle = self._flush_handles.pop(uid, None)
+        if handle is not None:
+            handle.cancel()
+        pcm = bytes(self._buffers.pop(uid, b""))
+        self._decoders.pop(uid, None)
+        if pcm:
+            asyncio.ensure_future(self._callback(member, pcm), loop=self._loop)
+
+    def cleanup(self) -> None:
+        for handle in self._flush_handles.values():
+            handle.cancel()
+        self._flush_handles.clear()
+        self._buffers.clear()
+        self._decoders.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -158,56 +169,74 @@ async def setup(bot: commands.Bot) -> None:
 class Listen_Commands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.listening: bool = False
-        self.voice_client: discord.VoiceClient | None = None
-        self.sink: VoiceSink | None = None
-        # Per-user conversation histories: {user_id: [{"role": ..., "content": ...}]}
-        self._histories: dict[int, list[dict]] = defaultdict(
+        self.voice_client: voice_recv.VoiceRecvClient | None = None
+        self.sink: ConversationSink | None = None
+        self._text_channel: discord.TextChannel | None = None
+        self._histories: dict[int, list] = defaultdict(
             lambda: [{"role": "system", "content": SYSTEM_PROMPT}]
         )
 
     # ------------------------------------------------------------------
-    # Internal pipeline: PCM → WAV → Whisper → Ollama → Piper → Discord
+    # Pipeline: Opus -> PCM -> Wyoming STT -> Ollama -> Wyoming TTS -> Discord
     # ------------------------------------------------------------------
 
-    async def _handle_audio(self, user_id: int, pcm: bytes):
-        """Full pipeline triggered when a user finishes speaking."""
-        # Find the User object so we can log/send feedback
-        user = self.bot.get_user(user_id)
-        username = user.name if user else str(user_id)
+    async def _handle_audio(self, user, pcm: bytes) -> None:
+        username = getattr(user, "name", str(user))
         logging.info(f"[listen_cmd] Processing {len(pcm)} PCM bytes from {username}.")
 
-        # 1. Convert to WAV
-        wav = pcm_to_wav(pcm)
-
-        # 2. Transcribe
-        transcript = await asyncio.to_thread(transcribe, wav)
-        if not transcript:
-            logging.info(f"[listen_cmd] Empty transcript for {username}, skipping.")
+        # 1. Transcribe — pass raw PCM directly, wyoming_stt handles the framing
+        try:
+            transcript = await wyoming_stt(
+                pcm,
+                host=WHISPER_HOST,
+                port=WHISPER_PORT,
+                rate=DISCORD_SAMPLE_RATE,
+                width=DISCORD_SAMPLE_WIDTH,
+                channels=DISCORD_CHANNELS,
+                language=WHISPER_LANG or None,
+            )
+        except Exception as e:
+            logging.error(f"[listen_cmd] STT failed for {username}: {e}")
             return
-        logging.info(f"[listen_cmd] {username} said: {transcript!r}")
 
-        # Optionally echo the transcript to the text channel the bot last used
+        if not transcript:
+            logging.info(f"[listen_cmd] Empty transcript from {username}, ignoring.")
+            return
+        logging.info(f"[listen_cmd] {username}: {transcript!r}")
+
         if self._text_channel:
             await self._text_channel.send(f"🎙️ **{username}**: {transcript}")
 
-        # 3. Build prompt and query LLM
-        history = self._histories[user_id]
+        # 2. Query Ollama
+        uid = user.id
+        history = self._histories[uid]
         history.append({"role": "user", "content": transcript})
-        reply = await asyncio.to_thread(query_llm, history)
+
+        reply = await query_llm(history)
         if not reply:
             logging.warning(f"[listen_cmd] LLM returned nothing for {username}.")
             return
         history.append({"role": "assistant", "content": reply})
-        logging.info(f"[listen_cmd] LLM reply: {reply!r}")
+        logging.info(f"[listen_cmd] Reply to {username}: {reply!r}")
 
         if self._text_channel:
             await self._text_channel.send(f"🤖 **Christotron**: {reply}")
 
-        # 4. TTS via Piper
-        source = await get_piper_audio_source_rest(reply, host=PIPER_HOST, port=PIPER_PORT, voice=PIPER_VOICE)
+        # 3. Synthesise via Wyoming Piper
+        try:
+            wav_out = await wyoming_tts(
+                reply,
+                host=PIPER_HOST,
+                port=PIPER_PORT,
+                voice=PIPER_VOICE,
+            )
+        except Exception as e:
+            logging.error(f"[listen_cmd] TTS failed: {e}")
+            return
 
-        # 5. Play back — queue if already playing
+        source = wav_to_discord_audio_source(wav_out)
+
+        # 4. Play back — wait if already playing so responses don't overlap
         if self.voice_client and self.voice_client.is_connected():
             while self.voice_client.is_playing():
                 await asyncio.sleep(0.2)
@@ -217,70 +246,79 @@ class Listen_Commands(commands.Cog):
             )
 
     # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _join_channel(self, interaction: discord.Interaction) -> voice_recv.VoiceRecvClient | None:
+        channel = interaction.user.voice.channel if interaction.user.voice else None
+        if not channel:
+            await interaction.channel.send("Thou art not in a voice channel, foolish mortal.")
+            return None
+
+        existing = interaction.client.voice_clients
+        if existing:
+            vc = existing[0]
+            if isinstance(vc, voice_recv.VoiceRecvClient) and vc.channel == channel:
+                return vc
+            await vc.disconnect()
+
+        return await channel.connect(cls=voice_recv.VoiceRecvClient, timeout=60.0, reconnect=True)
+
+    # ------------------------------------------------------------------
     # Slash commands
     # ------------------------------------------------------------------
 
     @app_commands.command(name="listen", description="Start listening and responding in your voice channel")
-    async def listen(self, interaction: discord.Interaction):
-        """Join the caller's voice channel and start the listen→respond loop."""
+    async def listen(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Lend me thine ears, for I am LISTENING.", ephemeral=True)
 
-        channel = interaction.user.voice.channel if interaction.user.voice else None
-        if not channel:
-            await interaction.channel.send("Thou art not in a voice channel, foolish mortal.")
+        vc = await self._join_channel(interaction)
+        if vc is None:
             return
 
-        # Join / reuse voice connection
-        if interaction.client.voice_clients:
-            vc = interaction.client.voice_clients[0]
-            if vc.channel != channel:
-                await vc.disconnect()
-                vc = await channel.connect(timeout=60.0, reconnect=True)
-        else:
-            vc = await channel.connect(timeout=60.0, reconnect=True)
+        if vc.is_listening():
+            vc.stop_listening()
+        if self.sink:
+            self.sink.cleanup()
 
         self.voice_client = vc
         self._text_channel = interaction.channel
-        self.listening = True
 
-        self.sink = VoiceSink(self._handle_audio)
+        self.sink = ConversationSink(self.bot.loop, self._handle_audio)
         vc.listen(self.sink)
 
         await interaction.channel.send(
-            f"👂 Christotron is now listening in **{channel.name}**. "
-            f"Speak, and receive divine wisdom (model: `{OLLAMA_MODEL}`)."
+            f"👂 Christotron is now listening in **{vc.channel.name}**. "
+            f"Speak thy piece — model: `{OLLAMA_MODEL}`."
         )
 
     @app_commands.command(name="unlisten", description="Stop listening and leave the voice channel")
-    async def unlisten(self, interaction: discord.Interaction):
-        """Stop listening and disconnect."""
+    async def unlisten(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Silence! The Lord commands it.", ephemeral=True)
-        self.listening = False
 
         if self.voice_client:
-            self.voice_client.stop_listening()
+            if self.voice_client.is_listening():
+                self.voice_client.stop_listening()
             if self.sink:
                 self.sink.cleanup()
                 self.sink = None
             await self.voice_client.disconnect()
             self.voice_client = None
 
-        await interaction.channel.send("🔇 Christotron hath stopped listening. Speak thy sins no more.")
+        await interaction.channel.send("🔇 Christotron hath ceased his vigil. Go in peace.")
 
     @app_commands.command(name="forget", description="Clear Christotron's memory of your conversation")
-    async def forget(self, interaction: discord.Interaction):
-        """Reset the conversation history for the calling user."""
+    async def forget(self, interaction: discord.Interaction) -> None:
         uid = interaction.user.id
         self._histories[uid] = [{"role": "system", "content": SYSTEM_PROMPT}]
         await interaction.response.send_message(
-            "Thy sins are forgiven and forgotten. A new covenant begins.", ephemeral=False
+            "Thy conversational sins are absolved. We begin anew.", ephemeral=False
         )
 
     @app_commands.command(name="setprompt", description="Override Christotron's personality system prompt")
-    async def setprompt(self, interaction: discord.Interaction, prompt: str):
-        """Replace the global system prompt (affects new conversations only)."""
+    async def setprompt(self, interaction: discord.Interaction, prompt: str) -> None:
         global SYSTEM_PROMPT
         SYSTEM_PROMPT = prompt
         await interaction.response.send_message(
-            f"System prompt updated. New persona unlocked:\n> {prompt}", ephemeral=False
+            f"✍️ System prompt updated. New personality:\n> {prompt}", ephemeral=False
         )

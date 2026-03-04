@@ -1,0 +1,79 @@
+---
+services:
+  faster-whisper:
+    image: lscr.io/linuxserver/faster-whisper:gpu
+    # image: linuxserver/faster-whisper:gpu-v2.5.0-ls3
+    container_name: faster-whisper
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - DEBUG=1 #optional
+      - LOCAL_ONLY=1 #optional
+      - WHISPER_MODEL=tiny-int8
+      - WHISPER_BEAM=1 #optional
+      - WHISPER_LANG=en #optional
+
+    volumes:
+      - /home/christotron/whisper/data:/config
+    ports:
+      - 10300:10300
+      # - 9000:9000
+    deploy:
+      resources:
+          reservations:
+              devices:
+                  - driver: nvidia
+                    count: all
+                    capabilities:
+                        - gpu
+    restart: unless-stopped
+
+  piper:
+    # image: piper-local:latest
+    image: rhasspy/wyoming-piper:2.2.2
+    # image: rhasspy/wyoming-piper:1.6.3
+    container_name: piper
+    volumes:
+      - /home/christotron/project_GLaDOS/piper/data:/data
+      # - /home/christotron/piper/share:/share/piper
+    environment:
+      - PYTHONUNBUFFERED="1"   # don't buffer stdout/stderr
+      - LOG_LEVEL="DEBUG"      # common Python/app var
+      - RUST_LOG="debug"       # in case any rust binary (piper) respects this
+    ports: 
+      - 10200:10200
+      - 5000:5000
+    # deploy:
+    #   resources:
+    #       reservations:
+    #           devices:
+    #               - driver: nvidia
+    #                 count: all
+    #                 capabilities:
+    #                     - gpu
+    command: --voice en_US-PordanJetersonMoM2017-ep595-medium #--use-cuda --debug
+    restart: unless-stopped
+
+  # piper:
+  #   image: lscr.io/linuxserver/piper:latest
+  #   container_name: piper
+  #   environment:
+  #     - PUID=1000
+  #     - PGID=1000
+  #     - TZ=Etc/UTC
+  #     - PIPER_VOICE=en_US-lessac-medium
+  #     - LOCAL_ONLY= #optional
+  #     - PIPER_LENGTH=1.0 #optional
+  #     - PIPER_NOISE=0.667 #optional
+  #     - PIPER_NOISEW=0.333 #optional
+  #     - PIPER_SPEAKER=0 #optional
+  #     - PIPER_PROCS=1 #optional
+  #     - STREAMING= #optional
+  #   volumes:
+  #     - /home/christotron/project_GLaDOS/piper/data:/data
+  #     # - /path/to/piper/data:/config
+  #   ports:
+  #     - 10200:10200
+  #     - 5000:5000
+  #   restart: unless-stopped
