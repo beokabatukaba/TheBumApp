@@ -8,7 +8,6 @@ import wave
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -16,6 +15,8 @@ from discord.ext import voice_recv
 from discord.opus import Decoder as OpusDecoder
 
 from wyoming_client import wyoming_tts, wyoming_stt
+
+import os
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -31,7 +32,7 @@ WHISPER_LANG  = os.getenv("WHISPER_LANG", "en")  # set to "" to auto-detect
 
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",  "127.0.0.1")
 OLLAMA_PORT   = int(os.getenv("OLLAMA_PORT", "11434"))
-OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "gemma3:latest")
+OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "gemma3:12b")
 
 # Seconds of silence that ends a speaking turn and triggers transcription
 SILENCE_THRESHOLD_S = float(os.getenv("SILENCE_THRESHOLD_S", "1.5"))
@@ -59,25 +60,6 @@ SYSTEM_PROMPT = os.getenv(
         "You occasionally drop unsolicited biblical references. Stay in character always."
     ),
 )
-
-# ---------------------------------------------------------------------------
-# PCM endianness helper
-# ---------------------------------------------------------------------------
-# discord.opus.Decoder is a C extension wrapping libopus.  When you call
-# .decode() yourself (i.e. wants_opus=True), libopus returns 16-bit signed
-# PCM in **big-endian** (network) byte order.  WAV files and Whisper both
-# require **little-endian**.  The garbled/digital sound in the debug WAVs —
-# and the poor transcription quality — are both caused by this byte swap.
-#
-# We fix it once here, immediately after decode, so every downstream
-# consumer (buffer accumulation, WAV dump, Wyoming STT) gets correct LE PCM.
-
-def _be_to_le_pcm(pcm: bytes) -> bytes:
-    """Swap bytes of a big-endian 16-bit PCM buffer to little-endian."""
-    a = array.array("h", pcm)   # interpret as signed 16-bit (native)
-    a.byteswap()                # flip each sample's bytes
-    return bytes(a)
-
 
 # ---------------------------------------------------------------------------
 # Debug audio dumping
@@ -137,7 +119,6 @@ def _dump_wav(pcm: bytes, username: str, label: str) -> None:
     except Exception as e:
         logging.warning(f"[listen_cmd/debug] Failed to dump WAV: {e}")
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -150,33 +131,19 @@ def wav_to_discord_audio_source(wav_bytes: bytes) -> discord.FFmpegPCMAudio:
 
 
 async def query_llm(conversation_history: list) -> str | None:
-    """Send conversation history to Ollama /api/chat. Blocking I/O run in a thread."""
+    """Send conversation history to Ollama /api/chat. Blocking call run in a thread."""
     import requests
 
     def _call():
         url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/chat"
-        payload = {
-            "model": OLLAMA_MODEL,
-            "messages": conversation_history,
-            "stream": False,
-        }
         try:
-            resp = requests.post(url, json=payload, timeout=60)
-            if resp.status_code == 404:
-                logging.error(
-                    f"[listen_cmd] Ollama returned 404 for model '{OLLAMA_MODEL}'. "
-                    f"Run `ollama list` to check available models, or set the "
-                    f"OLLAMA_MODEL env var to the correct name (e.g. 'gemma3:latest')."
-                )
-                return None
+            resp = requests.post(
+                url,
+                json={"model": OLLAMA_MODEL, "messages": conversation_history, "stream": False},
+                timeout=60,
+            )
             resp.raise_for_status()
             return resp.json()["message"]["content"].strip()
-        except requests.exceptions.ConnectionError:
-            logging.error(
-                f"[listen_cmd] Cannot reach Ollama at {OLLAMA_HOST}:{OLLAMA_PORT}. "
-                f"Is Ollama running?"
-            )
-            return None
         except Exception as e:
             logging.error(f"[listen_cmd] Ollama request failed: {e}")
             return None
@@ -191,10 +158,15 @@ async def query_llm(conversation_history: list) -> str | None:
 class ConversationSink(voice_recv.AudioSink):
     """
     Receives raw Opus payloads (wants_opus=True bypasses voice_recv's built-in
-    decoder, which crashes on comfort-noise packets). Decodes per-user with
-    our own OpusDecoder instances, byte-swaps to little-endian, accumulates
-    PCM, and fires an async callback after SILENCE_THRESHOLD_S seconds of
-    quiet from a given user.
+    decoder, which cannot handle DAVE-wrapped frames). We manually decode Opus
+    per-user with OpusDecoder, then pass the resulting PCM through
+    DAVESession.decrypt_frame(ssrc, pcm) if a DAVE session is active.
+
+    The DAVE E2EE layer wraps the raw PCM *before* Opus encoding on the sender's
+    side, so decryption must happen after Opus decoding.
+
+    Accumulates plaintext PCM and fires an async callback after
+    SILENCE_THRESHOLD_S seconds of quiet from a given user.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop, callback):
@@ -204,8 +176,17 @@ class ConversationSink(voice_recv.AudioSink):
         self._decoders:      dict[int, OpusDecoder]         = {}
         self._buffers:       dict[int, bytearray]           = defaultdict(bytearray)
         self._flush_handles: dict[int, asyncio.TimerHandle] = {}
+        self._dave_session = None  # davey.DAVESession, set via set_dave_session()
+
+    def set_dave_session(self, session) -> None:
+        """Attach a davey.DAVESession for post-decode PCM decryption."""
+        self._dave_session = session
+        logging.info("[listen_cmd] DAVE session attached to ConversationSink.")
 
     def wants_opus(self) -> bool:
+        # Must decode Opus ourselves — voice_recv's built-in decoder will crash
+        # with OpusError: corrupted stream when DAVE is active, because the Opus
+        # payload wraps DAVE-encrypted PCM bytes which aren't valid Opus data.
         return True
 
     def _get_decoder(self, uid: int) -> OpusDecoder:
@@ -224,15 +205,26 @@ class ConversationSink(voice_recv.AudioSink):
             return
 
         uid = user.id
+
+        # 1. Decode Opus -> PCM manually (avoids voice_recv built-in crash)
         try:
-            # libopus decode() returns big-endian 16-bit PCM when called
-            # directly (wants_opus=True path).  Swap to little-endian so
-            # WAV files and Whisper both receive correctly ordered samples.
-            pcm_be = self._get_decoder(uid).decode(opus_bytes, fec=False)
-            pcm = _be_to_le_pcm(pcm_be)
+            pcm = self._get_decoder(uid).decode(opus_bytes, fec=False)
         except Exception as e:
             logging.debug(f"[listen_cmd] Opus decode error from {getattr(user, 'name', uid)}: {e}")
             return
+
+        # 2. DAVE E2EE decryption on the decoded PCM (if a session is active).
+        #    DAVESession.decrypt_frame(ssrc, pcm_bytes) handles DAVE frame
+        #    parsing and AES128-GCM decryption, returning plaintext PCM.
+        if self._dave_session is not None:
+            try:
+                pcm = self._dave_session.decrypt_frame(data.packet.ssrc, pcm)
+            except Exception as e:
+                logging.debug(
+                    f"[listen_cmd] DAVE decrypt_frame failed for "
+                    f"{getattr(user, 'name', uid)}: {e}"
+                )
+                return
 
         self._buffers[uid].extend(pcm)
 
@@ -285,31 +277,60 @@ class Listen_Commands(commands.Cog):
         self._histories: dict[int, list] = defaultdict(
             lambda: [{"role": "system", "content": SYSTEM_PROMPT}]
         )
+        self._dave_session = None  # davey.DAVESession
 
     # ------------------------------------------------------------------
-    # Pipeline: Opus -> PCM -> Wyoming STT -> Ollama -> Wyoming TTS -> Discord
+    # DAVE session lifecycle
+    # ------------------------------------------------------------------
+
+    async def _init_dave_session(self, vc: voice_recv.VoiceRecvClient) -> None:
+        """Create a davey.DAVESession and wire it to the sink.
+
+        DAVESession(dave_version, user_id, channel_id) handles the full MLS
+        key-exchange handshake with Discord's voice gateway (opcodes 21-31) and
+        exposes decrypt_frame(ssrc, pcm) for per-frame decryption.
+        """
+        try:
+            from davey import DAVESession
+
+            session = DAVESession(
+                1,                      # DAVE protocol version
+                str(vc.guild.me.id),    # bot's own user ID
+                str(vc.channel.id),     # voice channel ID
+            )
+            await session.start(vc)
+            self._dave_session = session
+
+            if self.sink is not None:
+                self.sink.set_dave_session(session)
+
+            logging.info("[listen_cmd] DAVE session started successfully.")
+        except ImportError:
+            logging.warning(
+                "[listen_cmd] 'davey' package not found — DAVE E2EE decryption disabled. "
+                "Install it with: pip install davey"
+            )
+        except Exception as e:
+            logging.error(f"[listen_cmd] Failed to start DAVE session: {e}")
+
+    async def _teardown_dave_session(self) -> None:
+        if self._dave_session is not None:
+            try:
+                await self._dave_session.stop()
+            except Exception as e:
+                logging.debug(f"[listen_cmd] Error stopping DAVE session: {e}")
+            self._dave_session = None
+
+    # ------------------------------------------------------------------
+    # Pipeline: Opus -> PCM -> DAVE decrypt -> Wyoming STT -> Ollama -> Wyoming TTS -> Discord
     # ------------------------------------------------------------------
 
     async def _handle_audio(self, user, pcm: bytes) -> None:
         username = getattr(user, "name", str(user))
         logging.info(f"[listen_cmd] Processing {len(pcm)} PCM bytes from {username}.")
 
-        # Debug dump — always write the raw clip first so you can hear exactly
-        # what arrived from Discord, before any filtering is applied.
         _dump_wav(pcm, username, "prefilter")
-
-        # Gate: drop clips that are too short to contain real speech.
-        if len(pcm) < MIN_PCM_BYTES:
-            logging.info(
-                f"[listen_cmd] Clip from {username} is too short "
-                f"({len(pcm):,} < {MIN_PCM_BYTES:,} bytes / {MIN_AUDIO_SECONDS}s), skipping."
-            )
-            return
-
-        # Debug dump — write the clip that actually reaches Whisper.
-        # _dump_wav(pcm, username, "postfilter")
-
-        # 1. Transcribe
+        # 1. Transcribe — pass raw PCM directly, wyoming_stt handles the framing
         try:
             transcript = await wyoming_stt(
                 pcm,
@@ -327,7 +348,6 @@ class Listen_Commands(commands.Cog):
         if not transcript:
             logging.info(f"[listen_cmd] Empty transcript from {username}, ignoring.")
             return
-
         logging.info(f"[listen_cmd] {username}: {transcript!r}")
 
         if self._text_channel:
@@ -406,18 +426,22 @@ class Listen_Commands(commands.Cog):
             vc.stop_listening()
         if self.sink:
             self.sink.cleanup()
+        await self._teardown_dave_session()
 
         self.voice_client = vc
         self._text_channel = interaction.channel
 
         self.sink = ConversationSink(self.bot.loop, self._handle_audio)
-        # self.sink = voice_recv.WaveSink(destination='/home/christotron/TheBumApp/debug_audio/testwav.wav')
+
+        # Start DAVE session before attaching the sink so the MLS handshake
+        # can begin while Discord sends the first frames.
+        await self._init_dave_session(vc)
+
         vc.listen(self.sink)
 
-        debug_note = f" | 🎙️ Dumping audio → `{AUDIO_DEBUG_DIR}`" if AUDIO_DEBUG_DIR else ""
         await interaction.channel.send(
             f"👂 Christotron is now listening in **{vc.channel.name}**. "
-            f"Speak thy piece — model: `{OLLAMA_MODEL}`.{debug_note}"
+            f"Speak thy piece — model: `{OLLAMA_MODEL}`."
         )
 
     @app_commands.command(name="unlisten", description="Stop listening and leave the voice channel")
@@ -430,6 +454,7 @@ class Listen_Commands(commands.Cog):
             if self.sink:
                 self.sink.cleanup()
                 self.sink = None
+            await self._teardown_dave_session()
             await self.voice_client.disconnect()
             self.voice_client = None
 
