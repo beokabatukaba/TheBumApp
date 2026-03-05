@@ -158,8 +158,9 @@ class ConversationSink(voice_recv.AudioSink):
     decoder). We manually decode Opus per-user with OpusDecoder.
 
     When DAVE E2EE is active, each Opus payload is a DAVE-encrypted frame.
-    DAVESession.decrypt_frame() unwraps it to plain Opus bytes first, then we
-    Opus-decode those to PCM. Order: DAVE decrypt -> Opus decode -> accumulate.
+    session.decrypt(user_id, MediaType.audio, packet) unwraps it to plain Opus
+    bytes first, then we Opus-decode those to PCM.
+    Order: DAVE decrypt -> Opus decode -> accumulate.
 
     Accumulates plaintext PCM and fires an async callback after
     SILENCE_THRESHOLD_S seconds of quiet from a given user.
@@ -203,29 +204,33 @@ class ConversationSink(voice_recv.AudioSink):
         uid = user.id
         uname = getattr(user, "name", str(uid))
 
-        # 1. DAVE E2EE decryption (if active).
-        #    The DAVE frame wraps the Opus payload — decrypt it first to get
-        #    plain Opus bytes, then decode those to PCM below.
-        if self._dave_session is not None:
+        # 1. DAVE E2EE decryption (if session is active and ready).
+        #    session.decrypt(user_id, MediaType.audio, packet) unwraps the DAVE
+        #    frame to plain Opus bytes. user.id is the Discord user ID, not ssrc.
+        if self._dave_session is not None and self._dave_session.ready:
+            from davey import MediaType as DaveMediaType
             pre_len  = len(opus_bytes)
             pre_head = opus_bytes[:8].hex()
             pre_tail = opus_bytes[-4:].hex()
             try:
-                opus_bytes = self._dave_session.decrypt_frame(data.packet.ssrc, opus_bytes)
+                opus_bytes = self._dave_session.decrypt(uid, DaveMediaType.audio, opus_bytes)
                 post_len  = len(opus_bytes)
                 post_head = opus_bytes[:8].hex()
                 logging.debug(
-                    f"[listen_cmd/dave] {uname} ssrc={data.packet.ssrc} "
+                    f"[listen_cmd/dave] {uname} uid={uid} "
                     f"pre={pre_len}B head={pre_head} tail={pre_tail} "
                     f"post={post_len}B head={post_head}"
                 )
             except Exception as e:
                 logging.error(
-                    f"[listen_cmd/dave] decrypt_frame FAILED for {uname} "
-                    f"ssrc={data.packet.ssrc} pre={pre_len}B "
+                    f"[listen_cmd/dave] decrypt FAILED for {uname} "
+                    f"uid={uid} pre={pre_len}B "
                     f"head={pre_head} tail={pre_tail}: {type(e).__name__}: {e}"
                 )
                 return
+        elif self._dave_session is not None and not self._dave_session.ready:
+            logging.debug(f"[listen_cmd/dave] Session not yet ready, dropping packet from {uname}")
+            return
         else:
             logging.debug(f"[listen_cmd/dave] No DAVE session active for {uname}")
 
@@ -287,52 +292,180 @@ class Listen_Commands(commands.Cog):
         self._histories: dict[int, list] = defaultdict(
             lambda: [{"role": "system", "content": SYSTEM_PROMPT}]
         )
-        self._dave_session = None  # davey.DaveSession
+        self._dave_session = None      # davey.DaveSession
+        self._dave_ws_task = None      # asyncio.Task running the WS opcode handler
 
     # ------------------------------------------------------------------
     # DAVE session lifecycle
+    #
+    # DaveSession is a pure crypto object — there is no start()/stop().
+    # We must manually wire it to the voice gateway by:
+    #   1. Hooking the WS to receive DAVE opcodes (21-31)
+    #   2. Sending our key package (op 22) after receiving op 21
+    #   3. Processing proposals (op 27), welcome (op 30), commit (op 29)
+    #   4. Decrypting audio with session.decrypt(user_id, MediaType.audio, pkt)
+    #
+    # DAVE gateway opcodes:
+    #   21 = DAVE_PREPARE_TRANSITION   (server initiates, bot sends op 22)
+    #   22 = DAVE_EXECUTE_TRANSITION   (bot sends key package)
+    #   24 = DAVE_PREPARE_EPOCH        (server signals ready)
+    #   25 = DAVE_MLS_EXTERNAL_SENDER  (server sends external sender blob)
+    #   26 = DAVE_MLS_KEY_PACKAGE      (unused for receiving bot)
+    #   27 = DAVE_MLS_PROPOSALS        (server sends proposals; bot must commit)
+    #   28 = DAVE_MLS_COMMIT_WELCOME   (bot sends commit+optional welcome)
+    #   29 = DAVE_MLS_ANNOUNCE_COMMIT  (server sends commit)
+    #   30 = DAVE_MLS_WELCOME          (server sends welcome; bot processes it)
+    #   31 = DAVE_MLS_INVALID_COMMIT_WELCOME (server signals bad commit)
     # ------------------------------------------------------------------
 
     async def _init_dave_session(self, vc: voice_recv.VoiceRecvClient) -> None:
-        """Create a davey.DAVESession and wire it to the sink.
-
-        DaveSession(dave_version, user_id, channel_id) handles the full MLS
-        key-exchange handshake with Discord's voice gateway (opcodes 21-31) and
-        exposes decrypt_frame(ssrc, pcm) for per-frame decryption.
-        """
+        """Create a DaveSession and start the WS hook task."""
         try:
-            from davey import DaveSession
-
-            session = DaveSession(
-                1,                      # DAVE protocol version
-                vc.guild.me.id,         # bot's own user ID (int)
-                vc.channel.id,          # voice channel ID (int)
-            )
-            await session.start(vc)
-            self._dave_session = session
-
-            if self.sink is not None:
-                self.sink.set_dave_session(session)
-
-            logging.info("[listen_cmd] DAVE session started successfully.")
+            from davey import DaveSession, DAVE_PROTOCOL_VERSION
         except ImportError:
             logging.warning(
                 "[listen_cmd] 'davey' package not found — DAVE E2EE decryption disabled. "
                 "Install it with: pip install davey"
             )
-            raise
-        except Exception as e:
-            logging.error(f"[listen_cmd] Failed to start DAVE session with vc.guild.me.id {vc.guild.me.id} and vc.channel.id {vc.channel.id}: {e}")
+            return
 
-            raise
+        try:
+            session = DaveSession(
+                DAVE_PROTOCOL_VERSION,
+                vc.guild.me.id,
+                vc.channel.id,
+            )
+            self._dave_session = session
+
+            if self.sink is not None:
+                self.sink.set_dave_session(session)
+
+            # Launch a task that polls the raw voice WS for DAVE opcodes
+            self._dave_ws_task = asyncio.ensure_future(
+                self._dave_ws_loop(vc, session)
+            )
+            logging.info("[listen_cmd] DAVE session created, WS loop started.")
+        except Exception as e:
+            logging.error(f"[listen_cmd] Failed to create DAVE session: {e}")
+
+    async def _dave_ws_loop(self, vc: voice_recv.VoiceRecvClient, session) -> None:
+        """
+        Poll the voice WebSocket for DAVE MLS opcodes and drive the handshake.
+        voice_recv exposes the underlying DiscordVoiceWebSocket via vc.ws.
+        """
+        from davey import MediaType, ProposalsOperationType
+
+        # DAVE opcode constants
+        OP_PREPARE_TRANSITION  = 21
+        OP_EXECUTE_TRANSITION  = 22
+        OP_PREPARE_EPOCH       = 24
+        OP_EXTERNAL_SENDER     = 25
+        OP_PROPOSALS           = 27
+        OP_COMMIT_WELCOME      = 28
+        OP_ANNOUNCE_COMMIT     = 29
+        OP_WELCOME             = 30
+
+        ws = getattr(vc, 'ws', None)
+        if ws is None:
+            logging.warning("[listen_cmd] No voice WS found on VoiceRecvClient, DAVE disabled.")
+            return
+
+        logging.info("[listen_cmd] DAVE WS loop running.")
+        try:
+            while vc.is_connected() and self._dave_session is session:
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logging.debug(f"[listen_cmd/dave] WS recv error: {e}")
+                    break
+
+                import json
+                try:
+                    payload = json.loads(msg) if isinstance(msg, str) else msg
+                except Exception:
+                    continue
+
+                op = payload.get('op')
+                data = payload.get('d') or {}
+
+                if op == OP_PREPARE_TRANSITION:
+                    # Server is starting a DAVE transition — send our key package
+                    logging.info("[listen_cmd/dave] op21 PREPARE_TRANSITION received")
+                    key_pkg = session.get_serialized_key_package()
+                    import base64
+                    await ws.send(json.dumps({
+                        'op': OP_EXECUTE_TRANSITION,
+                        'd': {'key_package': base64.b64encode(key_pkg).decode()}
+                    }))
+                    logging.info("[listen_cmd/dave] op22 sent key package")
+
+                elif op == OP_EXTERNAL_SENDER:
+                    raw = data.get('external_sender') or data.get('data') or data
+                    if isinstance(raw, str):
+                        import base64
+                        raw = base64.b64decode(raw)
+                    elif isinstance(raw, dict):
+                        # May be the whole payload encoded
+                        continue
+                    session.set_external_sender(bytes(raw))
+                    logging.info("[listen_cmd/dave] op25 external sender set")
+
+                elif op == OP_PROPOSALS:
+                    raw = data.get('proposals') or data.get('data') or b''
+                    if isinstance(raw, str):
+                        import base64
+                        raw = base64.b64decode(raw)
+                    op_type_int = data.get('operation_type', 0)
+                    op_type = ProposalsOperationType(op_type_int)
+                    result = session.process_proposals(op_type, bytes(raw))
+                    logging.info(f"[listen_cmd/dave] op27 proposals processed (op_type={op_type})")
+                    if result is not None:
+                        # Send commit (and optional welcome) back
+                        import base64
+                        commit_b64 = base64.b64encode(result.commit).decode()
+                        welcome_b64 = base64.b64encode(result.welcome).decode() if result.welcome else None
+                        payload_out = {'commit': commit_b64}
+                        if welcome_b64:
+                            payload_out['welcome'] = welcome_b64
+                        await ws.send(json.dumps({'op': OP_COMMIT_WELCOME, 'd': payload_out}))
+                        logging.info("[listen_cmd/dave] op28 commit/welcome sent")
+
+                elif op == OP_WELCOME:
+                    raw = data.get('welcome') or data.get('data') or b''
+                    if isinstance(raw, str):
+                        import base64
+                        raw = base64.b64decode(raw)
+                    session.process_welcome(bytes(raw))
+                    logging.info(f"[listen_cmd/dave] op30 welcome processed, ready={session.ready}")
+
+                elif op == OP_ANNOUNCE_COMMIT:
+                    raw = data.get('commit') or data.get('data') or b''
+                    if isinstance(raw, str):
+                        import base64
+                        raw = base64.b64decode(raw)
+                    session.process_commit(bytes(raw))
+                    logging.info(f"[listen_cmd/dave] op29 commit processed, ready={session.ready}")
+
+                elif op == OP_PREPARE_EPOCH:
+                    logging.info("[listen_cmd/dave] op24 PREPARE_EPOCH received")
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.error(f"[listen_cmd/dave] WS loop error: {e}", exc_info=True)
+        logging.info("[listen_cmd] DAVE WS loop exited.")
 
     async def _teardown_dave_session(self) -> None:
-        if self._dave_session is not None:
+        if self._dave_ws_task is not None:
+            self._dave_ws_task.cancel()
             try:
-                await self._dave_session.stop()
-            except Exception as e:
-                logging.debug(f"[listen_cmd] Error stopping DAVE session: {e}")
-            self._dave_session = None
+                await self._dave_ws_task
+            except asyncio.CancelledError:
+                pass
+            self._dave_ws_task = None
+        self._dave_session = None
 
     # ------------------------------------------------------------------
     # Pipeline: Opus -> PCM -> DAVE decrypt -> Wyoming STT -> Ollama -> Wyoming TTS -> Discord
