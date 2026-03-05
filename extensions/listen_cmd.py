@@ -43,10 +43,12 @@ MIN_AUDIO_SECONDS = float(os.getenv("MIN_AUDIO_SECONDS", "0.75"))
 _BYTES_PER_SECOND = 48000 * 2 * 2  # rate * channels * width
 MIN_PCM_BYTES = int(MIN_AUDIO_SECONDS * _BYTES_PER_SECOND)
 
-# Discord voice PCM format constants
-DISCORD_SAMPLE_RATE  = 48000
-DISCORD_CHANNELS     = 2
-DISCORD_SAMPLE_WIDTH = 2  # bytes (16-bit)
+# DISCORD_SAMPLE_RATE  = 48000
+# DISCORD_CHANNELS     = 2
+# DISCORD_SAMPLE_WIDTH = 2
+DISCORD_CHANNELS = OpusDecoder.CHANNELS
+DISCORD_SAMPLE_WIDTH = OpusDecoder.SAMPLE_SIZE // OpusDecoder.CHANNELS
+DISCORD_SAMPLE_RATE = OpusDecoder.SAMPLING_RATE
 
 SYSTEM_PROMPT = os.getenv(
     "BOT_SYSTEM_PROMPT",
@@ -305,7 +307,7 @@ class Listen_Commands(commands.Cog):
             return
 
         # Debug dump — write the clip that actually reaches Whisper.
-        _dump_wav(pcm, username, "postfilter")
+        # _dump_wav(pcm, username, "postfilter")
 
         # 1. Transcribe
         try:
@@ -409,6 +411,7 @@ class Listen_Commands(commands.Cog):
         self._text_channel = interaction.channel
 
         self.sink = ConversationSink(self.bot.loop, self._handle_audio)
+        # self.sink = voice_recv.WaveSink(destination='/home/christotron/TheBumApp/debug_audio/testwav.wav')
         vc.listen(self.sink)
 
         debug_note = f" | 🎙️ Dumping audio → `{AUDIO_DEBUG_DIR}`" if AUDIO_DEBUG_DIR else ""
