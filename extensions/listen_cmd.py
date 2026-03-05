@@ -1,4 +1,3 @@
-import array
 import asyncio
 import io
 import logging
@@ -8,6 +7,7 @@ import wave
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -15,8 +15,6 @@ from discord.ext import voice_recv
 from discord.opus import Decoder as OpusDecoder
 
 from wyoming_client import wyoming_tts, wyoming_stt
-
-import os
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -44,12 +42,10 @@ MIN_AUDIO_SECONDS = float(os.getenv("MIN_AUDIO_SECONDS", "0.75"))
 _BYTES_PER_SECOND = 48000 * 2 * 2  # rate * channels * width
 MIN_PCM_BYTES = int(MIN_AUDIO_SECONDS * _BYTES_PER_SECOND)
 
-# DISCORD_SAMPLE_RATE  = 48000
-# DISCORD_CHANNELS     = 2
-# DISCORD_SAMPLE_WIDTH = 2
-DISCORD_CHANNELS = OpusDecoder.CHANNELS
+# Derived from OpusDecoder so they always stay in sync with the library.
+DISCORD_CHANNELS     = OpusDecoder.CHANNELS
 DISCORD_SAMPLE_WIDTH = OpusDecoder.SAMPLE_SIZE // OpusDecoder.CHANNELS
-DISCORD_SAMPLE_RATE = OpusDecoder.SAMPLING_RATE
+DISCORD_SAMPLE_RATE  = OpusDecoder.SAMPLING_RATE
 
 SYSTEM_PROMPT = os.getenv(
     "BOT_SYSTEM_PROMPT",
@@ -119,6 +115,7 @@ def _dump_wav(pcm: bytes, username: str, label: str) -> None:
     except Exception as e:
         logging.warning(f"[listen_cmd/debug] Failed to dump WAV: {e}")
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -158,12 +155,11 @@ async def query_llm(conversation_history: list) -> str | None:
 class ConversationSink(voice_recv.AudioSink):
     """
     Receives raw Opus payloads (wants_opus=True bypasses voice_recv's built-in
-    decoder, which cannot handle DAVE-wrapped frames). We manually decode Opus
-    per-user with OpusDecoder, then pass the resulting PCM through
-    DAVESession.decrypt_frame(ssrc, pcm) if a DAVE session is active.
+    decoder). We manually decode Opus per-user with OpusDecoder.
 
-    The DAVE E2EE layer wraps the raw PCM *before* Opus encoding on the sender's
-    side, so decryption must happen after Opus decoding.
+    When DAVE E2EE is active, each Opus payload is a DAVE-encrypted frame.
+    DAVESession.decrypt_frame() unwraps it to plain Opus bytes first, then we
+    Opus-decode those to PCM. Order: DAVE decrypt -> Opus decode -> accumulate.
 
     Accumulates plaintext PCM and fires an async callback after
     SILENCE_THRESHOLD_S seconds of quiet from a given user.
@@ -176,10 +172,10 @@ class ConversationSink(voice_recv.AudioSink):
         self._decoders:      dict[int, OpusDecoder]         = {}
         self._buffers:       dict[int, bytearray]           = defaultdict(bytearray)
         self._flush_handles: dict[int, asyncio.TimerHandle] = {}
-        self._dave_session = None  # davey.DAVESession, set via set_dave_session()
+        self._dave_session = None  # davey.DaveSession, set via set_dave_session()
 
     def set_dave_session(self, session) -> None:
-        """Attach a davey.DAVESession for post-decode PCM decryption."""
+        """Attach a davey.DaveSession for post-decode PCM decryption."""
         self._dave_session = session
         logging.info("[listen_cmd] DAVE session attached to ConversationSink.")
 
@@ -205,26 +201,40 @@ class ConversationSink(voice_recv.AudioSink):
             return
 
         uid = user.id
+        uname = getattr(user, "name", str(uid))
 
-        # 1. Decode Opus -> PCM manually (avoids voice_recv built-in crash)
+        # 1. DAVE E2EE decryption (if active).
+        #    The DAVE frame wraps the Opus payload — decrypt it first to get
+        #    plain Opus bytes, then decode those to PCM below.
+        if self._dave_session is not None:
+            pre_len  = len(opus_bytes)
+            pre_head = opus_bytes[:8].hex()
+            pre_tail = opus_bytes[-4:].hex()
+            try:
+                opus_bytes = self._dave_session.decrypt_frame(data.packet.ssrc, opus_bytes)
+                post_len  = len(opus_bytes)
+                post_head = opus_bytes[:8].hex()
+                logging.debug(
+                    f"[listen_cmd/dave] {uname} ssrc={data.packet.ssrc} "
+                    f"pre={pre_len}B head={pre_head} tail={pre_tail} "
+                    f"post={post_len}B head={post_head}"
+                )
+            except Exception as e:
+                logging.error(
+                    f"[listen_cmd/dave] decrypt_frame FAILED for {uname} "
+                    f"ssrc={data.packet.ssrc} pre={pre_len}B "
+                    f"head={pre_head} tail={pre_tail}: {type(e).__name__}: {e}"
+                )
+                return
+        else:
+            logging.debug(f"[listen_cmd/dave] No DAVE session active for {uname}")
+
+        # 2. Opus decode -> PCM
         try:
             pcm = self._get_decoder(uid).decode(opus_bytes, fec=False)
         except Exception as e:
-            logging.debug(f"[listen_cmd] Opus decode error from {getattr(user, 'name', uid)}: {e}")
+            logging.warning(f"[listen_cmd] Opus decode error from {uname}: {e}")
             return
-
-        # 2. DAVE E2EE decryption on the decoded PCM (if a session is active).
-        #    DAVESession.decrypt_frame(ssrc, pcm_bytes) handles DAVE frame
-        #    parsing and AES128-GCM decryption, returning plaintext PCM.
-        if self._dave_session is not None:
-            try:
-                pcm = self._dave_session.decrypt_frame(data.packet.ssrc, pcm)
-            except Exception as e:
-                logging.debug(
-                    f"[listen_cmd] DAVE decrypt_frame failed for "
-                    f"{getattr(user, 'name', uid)}: {e}"
-                )
-                return
 
         self._buffers[uid].extend(pcm)
 
@@ -277,7 +287,7 @@ class Listen_Commands(commands.Cog):
         self._histories: dict[int, list] = defaultdict(
             lambda: [{"role": "system", "content": SYSTEM_PROMPT}]
         )
-        self._dave_session = None  # davey.DAVESession
+        self._dave_session = None  # davey.DaveSession
 
     # ------------------------------------------------------------------
     # DAVE session lifecycle
@@ -286,17 +296,17 @@ class Listen_Commands(commands.Cog):
     async def _init_dave_session(self, vc: voice_recv.VoiceRecvClient) -> None:
         """Create a davey.DAVESession and wire it to the sink.
 
-        DAVESession(dave_version, user_id, channel_id) handles the full MLS
+        DaveSession(dave_version, user_id, channel_id) handles the full MLS
         key-exchange handshake with Discord's voice gateway (opcodes 21-31) and
         exposes decrypt_frame(ssrc, pcm) for per-frame decryption.
         """
         try:
-            from davey import DAVESession
+            from davey import DaveSession
 
-            session = DAVESession(
+            session = DaveSession(
                 1,                      # DAVE protocol version
-                str(vc.guild.me.id),    # bot's own user ID
-                str(vc.channel.id),     # voice channel ID
+                vc.guild.me.id,         # bot's own user ID (int)
+                vc.channel.id,          # voice channel ID (int)
             )
             await session.start(vc)
             self._dave_session = session
@@ -310,8 +320,11 @@ class Listen_Commands(commands.Cog):
                 "[listen_cmd] 'davey' package not found — DAVE E2EE decryption disabled. "
                 "Install it with: pip install davey"
             )
+            raise
         except Exception as e:
-            logging.error(f"[listen_cmd] Failed to start DAVE session: {e}")
+            logging.error(f"[listen_cmd] Failed to start DAVE session with vc.guild.me.id {vc.guild.me.id} and vc.channel.id {vc.channel.id}: {e}")
+
+            raise
 
     async def _teardown_dave_session(self) -> None:
         if self._dave_session is not None:
@@ -330,6 +343,13 @@ class Listen_Commands(commands.Cog):
         logging.info(f"[listen_cmd] Processing {len(pcm)} PCM bytes from {username}.")
 
         _dump_wav(pcm, username, "prefilter")
+
+        if len(pcm) < MIN_PCM_BYTES:
+            logging.info(f"[listen_cmd] Clip too short from {username} ({len(pcm)} < {MIN_PCM_BYTES} bytes), ignoring.")
+            return
+
+        _dump_wav(pcm, username, "postfilter")
+
         # 1. Transcribe — pass raw PCM directly, wyoming_stt handles the framing
         try:
             transcript = await wyoming_stt(
@@ -382,14 +402,30 @@ class Listen_Commands(commands.Cog):
 
         source = wav_to_discord_audio_source(wav_out)
 
-        # 4. Play back — wait if already playing so responses don't overlap
-        if self.voice_client and self.voice_client.is_connected():
-            while self.voice_client.is_playing():
-                await asyncio.sleep(0.2)
-            self.voice_client.play(
-                source,
-                after=lambda e: logging.error(f"[listen_cmd] Playback error: {e}") if e else None,
-            )
+        # 4. Play back via the voice client, mirroring voice_cmd.py's speak_praise.
+        #    Pause listening while we speak so we don't hear ourselves, then resume.
+        vc = self.voice_client
+        if not (vc and vc.is_connected()):
+            logging.warning("[listen_cmd] Voice client gone before playback, dropping reply.")
+            return
+
+        # Stop listening so bot doesn't transcribe its own TTS output
+        was_listening = vc.is_listening()
+        if was_listening:
+            vc.stop_listening()
+
+        # Wait for any previous playback to finish
+        while vc.is_playing():
+            await asyncio.sleep(0.1)
+
+        def _after_play(err):
+            if err:
+                logging.error(f"[listen_cmd] Playback error: {err}")
+            # Resume listening after playback completes (called from a background thread)
+            if was_listening and vc.is_connected() and self.sink is not None:
+                vc.listen(self.sink)
+
+        vc.play(source, after=_after_play)
 
     # ------------------------------------------------------------------
     # Helpers
