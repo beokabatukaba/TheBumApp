@@ -30,7 +30,7 @@ WHISPER_LANG  = os.getenv("WHISPER_LANG", "en")  # set to "" to auto-detect
 
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",  "127.0.0.1")
 OLLAMA_PORT   = int(os.getenv("OLLAMA_PORT", "11434"))
-OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "qwen3.5:0.8b")
+OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "srinadhch07/brundha_fast:6.0")
 
 # Seconds of silence that ends a speaking turn and triggers transcription
 SILENCE_THRESHOLD_S = float(os.getenv("SILENCE_THRESHOLD_S", "1.5"))
@@ -444,6 +444,26 @@ class Listen_Commands(commands.Cog):
         self.voice_client = vc
         self._text_channel = interaction.channel
 
+        # # 3. Synthesise via Wyoming Piper
+        # wav_out = await wyoming_tts(
+        #     "Lend me thine ears, for I am LISTENING.",
+        #     host=PIPER_HOST,
+        #     port=PIPER_PORT,
+        #     voice=PIPER_VOICE,
+        # )
+
+        # source = wav_to_discord_audio_source(wav_out)
+
+        # # 4. Play back; clean up after playback completes.
+        # if not (vc and vc.is_connected()):
+        #     logging.warning("[listen_cmd] Voice client gone before playback, dropping reply.")
+        #     return
+
+        # while vc.is_playing():
+        #     await asyncio.sleep(0.1)
+
+        # vc.play(source)
+
         # warmup_s discards audio for the first 0.5s after the sink is attached,
         # catching any residual frames the sleep above didn't cover.
         self.sink = ConversationSink(self.bot.loop, self._handle_audio, warmup_s=0.5)
@@ -451,7 +471,7 @@ class Listen_Commands(commands.Cog):
 
         await interaction.channel.send(
             f"👂 Christotron is now listening in **{vc.channel.name}**. "
-            f"Speak thy piece — model: `{OLLAMA_MODEL}`."
+            f"Speak thy peace — model: `{OLLAMA_MODEL}`."
         )
 
     @app_commands.command(name="unlisten", description="Stop listening and leave the voice channel")
