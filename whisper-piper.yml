@@ -1,8 +1,8 @@
 ---
 services:
   faster-whisper:
-    image: lscr.io/linuxserver/faster-whisper:latest
-    # image: linuxserver/faster-whisper:gpu-v2.5.0-ls3
+    # image: lscr.io/linuxserver/faster-whisper:latest
+    image: linuxserver/faster-whisper:3.1.0-gpu-legacy
     container_name: faster-whisper
     environment:
       - PUID=1000
@@ -19,14 +19,14 @@ services:
     ports:
       - 10300:10300
       # - 9000:9000
-    # deploy:
-    #   resources:
-    #       reservations:
-    #           devices:
-    #               - driver: nvidia
-    #                 count: all
-    #                 capabilities:
-    #                     - gpu
+    deploy:
+      resources:
+          reservations:
+              devices:
+                  - driver: nvidia
+                    count: all
+                    capabilities:
+                        - gpu
     restart: unless-stopped
 
   piper:
@@ -44,15 +44,15 @@ services:
     ports: 
       - 10200:10200
       - 5000:5000
-    # deploy:
-    #   resources:
-    #       reservations:
-    #           devices:
-    #               - driver: nvidia
-    #                 count: all
-    #                 capabilities:
-    #                     - gpu
-    command: --voice en_US-PordanJetersonMoM2017-ep595-medium #--use-cuda --debug
+    deploy:
+      resources:
+          reservations:
+              devices:
+                  - driver: nvidia
+                    count: all
+                    capabilities:
+                        - gpu
+    command: --voice en_US-PordanJetersonMoM2017-ep595-medium --use-cuda #--debug
     restart: unless-stopped
 
   # piper:

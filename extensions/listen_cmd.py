@@ -30,7 +30,7 @@ WHISPER_LANG  = os.getenv("WHISPER_LANG", "en")  # set to "" to auto-detect
 
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",  "127.0.0.1")
 OLLAMA_PORT   = int(os.getenv("OLLAMA_PORT", "11434"))
-OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "gemma3:12b")
+OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "qwen3.5:0.8b")
 
 # Seconds of silence that ends a speaking turn and triggers transcription
 SILENCE_THRESHOLD_S = float(os.getenv("SILENCE_THRESHOLD_S", "1.5"))
@@ -169,13 +169,22 @@ class ConversationSink(voice_recv.AudioSink):
     SILENCE_THRESHOLD_S seconds of quiet from a given user.
     """
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, callback):
+    def __init__(self, loop: asyncio.AbstractEventLoop, callback, *, warmup_s: float = 0.5):
         super().__init__()
         self._loop = loop
         self._callback = callback  # async def callback(user, pcm: bytes)
         self._decoders:      dict[int, OpusDecoder]         = {}
         self._buffers:       dict[int, bytearray]           = defaultdict(bytearray)
         self._flush_handles: dict[int, asyncio.TimerHandle] = {}
+        # Discard audio for a short period after creation so stale frames
+        # buffered by the voice stack before the new sink was attached don't
+        # sneak into the pipeline.
+        self._muted: bool = True
+        self._loop.call_later(warmup_s, self._unmute)
+
+    def _unmute(self) -> None:
+        self._muted = False
+        logging.debug("[listen_cmd] ConversationSink warmup complete, now accepting audio.")
 
     def wants_opus(self) -> bool:
         # Take raw (post-DAVE-decrypt) Opus bytes so we can catch decode errors
@@ -188,6 +197,8 @@ class ConversationSink(voice_recv.AudioSink):
         return self._decoders[uid]
 
     def write(self, user, data: voice_recv.VoiceData) -> None:
+        if self._muted:
+            return
         if user is None:
             return
         if data.packet.is_silence():
@@ -218,7 +229,7 @@ class ConversationSink(voice_recv.AudioSink):
         pcm = bytes(self._buffers.pop(uid, b""))
         self._flush_handles.pop(uid, None)
         if pcm:
-            asyncio.ensure_future(self._callback(user, pcm), loop=self._loop)
+            asyncio.run_coroutine_threadsafe(self._callback(user, pcm), self._loop)
 
     @voice_recv.AudioSink.listener()
     def on_voice_member_disconnect(self, member: discord.Member, ssrc) -> None:
@@ -229,7 +240,7 @@ class ConversationSink(voice_recv.AudioSink):
         pcm = bytes(self._buffers.pop(uid, b""))
         self._decoders.pop(uid, None)
         if pcm:
-            asyncio.ensure_future(self._callback(member, pcm), loop=self._loop)
+            asyncio.run_coroutine_threadsafe(self._callback(member, pcm), self._loop)
 
     def cleanup(self) -> None:
         for handle in self._flush_handles.values():
@@ -257,6 +268,25 @@ class Listen_Commands(commands.Cog):
             lambda: [{"role": "system", "content": SYSTEM_PROMPT}]
         )
 
+
+    async def cog_unload(self) -> None:
+        """Called automatically when the cog is unloaded (e.g. on bot shutdown).
+        Stops listening and disconnects from voice so the AudioReader threads
+        finish cleanly rather than blocking the event loop shutdown.
+        """
+        if self.voice_client is not None:
+            if self.voice_client.is_listening():
+                self.voice_client.stop_listening()
+            if self.sink is not None:
+                self.sink.cleanup()
+                self.sink = None
+            try:
+                await self.voice_client.disconnect(force=True)
+            except Exception as e:
+                logging.warning(f"[listen_cmd] Error disconnecting on unload: {e}")
+            self.voice_client = None
+        logging.info("[listen_cmd] Cog unloaded cleanly.")
+
     # ------------------------------------------------------------------
     # Pipeline: Opus → PCM → Wyoming STT → Ollama → Wyoming TTS → Discord
     # ------------------------------------------------------------------
@@ -273,22 +303,26 @@ class Listen_Commands(commands.Cog):
 
         _dump_wav(pcm, username, "postfilter")
 
-        # Stop listening for the entire STT → LLM → TTS → playback pipeline so
-        # we don't pile up concurrent processing jobs or hear our own output.
+        # Stop listening immediately — one-shot mode means we don't resume
+        # after responding. Use /listen again for the next exchange.
         vc = self.voice_client
         if not (vc and vc.is_connected()):
             return
         if vc.is_listening():
             vc.stop_listening()
+
+        async def _cleanup_and_announce_done():
+            """Clean up the sink after playback and signal the user to /listen again."""
+            if self.sink is not None:
+                self.sink.cleanup()
+                self.sink = None
+            if self._text_channel:
+                await self._text_channel.send(
+                    "✅ *Christotron hath spoken. Use* `/listen` *again when thou art ready.*"
+                )
+
         if self._text_channel:
             await self._text_channel.send("🤔 *Christotron pondereth thy words...*")
-
-        async def _resume():
-            """Re-attach the sink after playback and announce readiness."""
-            if vc.is_connected() and self.sink is not None:
-                vc.listen(self.sink)
-                if self._text_channel:
-                    await self._text_channel.send("👂 *Christotron's ears are open once more. Speak, mortal.*")
 
         try:
             # 1. Transcribe
@@ -304,10 +338,12 @@ class Listen_Commands(commands.Cog):
                 )
             except Exception as e:
                 logging.error(f"[listen_cmd] STT failed for {username}: {e}")
+                await _cleanup_and_announce_done()
                 return
 
             if not transcript:
                 logging.info(f"[listen_cmd] Empty transcript from {username}, ignoring.")
+                await _cleanup_and_announce_done()
                 return
             logging.info(f"[listen_cmd] {username}: {transcript!r}")
 
@@ -322,6 +358,7 @@ class Listen_Commands(commands.Cog):
             reply = await query_llm(history)
             if not reply:
                 logging.warning(f"[listen_cmd] LLM returned nothing for {username}.")
+                await _cleanup_and_announce_done()
                 return
             history.append({"role": "assistant", "content": reply})
             logging.info(f"[listen_cmd] Reply to {username}: {reply!r}")
@@ -339,29 +376,28 @@ class Listen_Commands(commands.Cog):
                 )
             except Exception as e:
                 logging.error(f"[listen_cmd] TTS failed: {e}")
+                await _cleanup_and_announce_done()
                 return
 
             source = wav_to_discord_audio_source(wav_out)
 
-            # 4. Play back; resume listening in the after-callback.
+            # 4. Play back; clean up after playback completes.
             if not (vc and vc.is_connected()):
                 logging.warning("[listen_cmd] Voice client gone before playback, dropping reply.")
                 return
 
-            # Wait for any previous playback to finish
             while vc.is_playing():
                 await asyncio.sleep(0.1)
 
             def _after_play(err):
                 if err:
                     logging.error(f"[listen_cmd] Playback error: {err}")
-                asyncio.ensure_future(_resume(), loop=self._loop)
+                asyncio.run_coroutine_threadsafe(_cleanup_and_announce_done(), self.bot.loop)
 
             vc.play(source, after=_after_play)
 
         except Exception:
-            # If anything explodes mid-pipeline, make sure we resume listening.
-            await _resume()
+            await _cleanup_and_announce_done()
             raise
 
     # ------------------------------------------------------------------
@@ -399,11 +435,18 @@ class Listen_Commands(commands.Cog):
             vc.stop_listening()
         if self.sink:
             self.sink.cleanup()
+            self.sink = None
+        # Small pause to let the voice stack drain any buffered packets from the
+        # previous session before we attach the new sink. Without this, frames
+        # that were already in-flight get delivered to the new sink immediately.
+        await asyncio.sleep(0.3)
 
         self.voice_client = vc
         self._text_channel = interaction.channel
 
-        self.sink = ConversationSink(self.bot.loop, self._handle_audio)
+        # warmup_s discards audio for the first 0.5s after the sink is attached,
+        # catching any residual frames the sleep above didn't cover.
+        self.sink = ConversationSink(self.bot.loop, self._handle_audio, warmup_s=0.5)
         vc.listen(self.sink)
 
         await interaction.channel.send(

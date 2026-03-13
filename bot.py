@@ -2,28 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 bot.py
-
-Created on Sat May 30 11:23:35 2020
-
-@user: The Mender of Arse Juice
 """
 import asyncio
 import os
-import io
-import random
-import discord
-import youtube_dl
-import watchgod
+import ast
+import platform
+import signal
 import logging
 import logging.handlers
-import ast
-import functools
-import typing
-import platform
+
+import discord
+import watchgod
 from discord.ext import commands
 from dotenv import load_dotenv
 from client import MyClient
-from gtts import gTTS, lang
 from resources.constants import *
 
 
@@ -31,16 +23,13 @@ load_dotenv(verbose=True)
 DG_ID = os.getenv('DISCORD_GUILD_ID')
 MY_GUILD = discord.Object(id=DG_ID)
 TOKEN = os.getenv('DISCORD_TOKEN')
-PARENT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
-HOLY_SCRIPTURE_TXT = f"{PARENT_DIRECTORY}/resources/HolyScripture.txt"
-USER_LEGEND_TXT = f"{PARENT_DIRECTORY}/resources/UserLegend.txt"
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = MyClient(intents=intents)
 
-# @client.command(name="sync")
-@client.tree.command(name = "sync", description = "My first application Command")
+
+@client.tree.command(name="sync", description="Sync application commands")
 @commands.guild_only()
 @commands.is_owner()
 async def sync(interaction: discord.Interaction) -> None:
@@ -49,13 +38,7 @@ async def sync(interaction: discord.Interaction) -> None:
     synced = await client.tree.sync()
     logging.info(f"Synced {len(synced)} commands")
     await interaction.channel.send(f"Synced {len(synced)} commands")
-    return
 
-async def start_bot():
-    await client.start(TOKEN)
-
-async def stop_bot():
-    await client.logout()
 
 async def reload_extension(filename: str):
     try:
@@ -64,31 +47,64 @@ async def reload_extension(filename: str):
     except Exception as e:
         logging.warning(f"Failed to reload extension: {e}")
 
+
 async def watch_extensions():
     async for changes in watchgod.awatch("./extensions/", watcher_cls=watchgod.DefaultWatcher):
         for change in changes:
             path = change[1].lstrip('./extensions/')
-            print(path)
             logging.info(f"Detected change in {path}.")
             try:
                 with open(change[1], "rb") as f:
                     ast.parse(f.read())
             except Exception as e:
-                logging.error(f"Failed to reload extension on account of error {e} contains invalid Python code.")
+                logging.error(f"Extension has invalid Python, skipping reload: {e}")
             else:
                 await reload_extension(path)
 
+
 async def main():
-    # Necessary for Linux I guess but not Windows
     if platform.system() != 'Windows':
-        # This might be the path with sudo apt install libopus-dev
         discord.opus.load_opus('/usr/lib/x86_64-linux-gnu/libopus.so.0.9.0')
         if not discord.opus.is_loaded():
             raise RuntimeError('Opus failed to load')
+
+    loop = asyncio.get_running_loop()
+
+    # --- Clean shutdown on Ctrl-C (SIGINT) or SIGTERM ---
+    # Instead of letting KeyboardInterrupt nondeterministically interrupt a
+    # coroutine mid-flight, we catch the signal, cancel all running tasks, and
+    # let each one unwind through its normal exception handling path.
+    shutdown_event = asyncio.Event()
+
+    def _request_shutdown():
+        logging.info("[bot] Shutdown signal received — stopping gracefully...")
+        shutdown_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _request_shutdown)
+
+    watcher_task = asyncio.create_task(watch_extensions(), name="watch_extensions")
+
     async with client:
-        await asyncio.gather(start_bot(), watch_extensions())
+        bot_task = asyncio.create_task(client.start(TOKEN), name="client_start")
+
+        # Wait until either a shutdown signal fires or the bot task ends on its own.
+        done, pending = await asyncio.wait(
+            [bot_task, watcher_task, asyncio.create_task(shutdown_event.wait(), name="shutdown_sentinel")],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # Cancel everything that's still running.
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        logging.info("[bot] All tasks stopped. Goodbye.")
+
 
 if __name__ == '__main__':
-
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
