@@ -30,7 +30,7 @@ WHISPER_LANG  = os.getenv("WHISPER_LANG", "en")  # set to "" to auto-detect
 
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",  "127.0.0.1")
 OLLAMA_PORT   = int(os.getenv("OLLAMA_PORT", "11434"))
-OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "srinadhch07/brundha_fast:6.0")
+OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "gemma3:12b")
 
 # Seconds of silence that ends a speaking turn and triggers transcription
 SILENCE_THRESHOLD_S = float(os.getenv("SILENCE_THRESHOLD_S", "1.5"))
@@ -127,6 +127,13 @@ def wav_to_discord_audio_source(wav_bytes: bytes) -> discord.FFmpegPCMAudio:
     return discord.FFmpegPCMAudio(buf, pipe=True)
 
 
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+def _strip_reasoning(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks produced by CoT models."""
+    return _THINK_RE.sub("", text).strip()
+
+
 async def query_llm(conversation_history: list) -> str | None:
     """Send conversation history to Ollama /api/chat. Blocking call run in a thread."""
     import requests
@@ -136,11 +143,17 @@ async def query_llm(conversation_history: list) -> str | None:
         try:
             resp = requests.post(
                 url,
-                json={"model": OLLAMA_MODEL, "messages": conversation_history, "stream": False},
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": conversation_history,
+                    "stream": False,
+                    "think": False,  # suppresses reasoning for models that support it (e.g. qwen3)
+                },
                 timeout=60,
             )
             resp.raise_for_status()
-            return resp.json()["message"]["content"].strip()
+            content = resp.json()["message"]["content"].strip()
+            return _strip_reasoning(content) or None
         except Exception as e:
             logging.error(f"[listen_cmd] Ollama request failed: {e}")
             return None
@@ -169,13 +182,15 @@ class ConversationSink(voice_recv.AudioSink):
     SILENCE_THRESHOLD_S seconds of quiet from a given user.
     """
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, callback, *, warmup_s: float = 0.5):
+    def __init__(self, loop: asyncio.AbstractEventLoop, callback, *, warmup_s: float = 0.5, target_user_id: int | None = None):
         super().__init__()
         self._loop = loop
         self._callback = callback  # async def callback(user, pcm: bytes)
         self._decoders:      dict[int, OpusDecoder]         = {}
         self._buffers:       dict[int, bytearray]           = defaultdict(bytearray)
         self._flush_handles: dict[int, asyncio.TimerHandle] = {}
+        # If set, only audio from this Discord user ID is processed.
+        self._target_user_id: int | None = target_user_id
         # Discard audio for a short period after creation so stale frames
         # buffered by the voice stack before the new sink was attached don't
         # sneak into the pipeline.
@@ -200,6 +215,8 @@ class ConversationSink(voice_recv.AudioSink):
         if self._muted:
             return
         if user is None:
+            return
+        if self._target_user_id is not None and user.id != self._target_user_id:
             return
         if data.packet.is_silence():
             return
@@ -424,7 +441,16 @@ class Listen_Commands(commands.Cog):
     # ------------------------------------------------------------------
 
     @app_commands.command(name="listen", description="Start listening and responding in your voice channel")
-    async def listen(self, interaction: discord.Interaction) -> None:
+    @app_commands.describe(
+        target="Only listen to this user (leave blank to listen to everyone)",
+        announce="Speak an announcement when Christotron starts listening (default: True)",
+    )
+    async def listen(
+        self,
+        interaction: discord.Interaction,
+        target: discord.Member | None = None,
+        announce: bool = True,
+    ) -> None:
         await interaction.response.send_message("Lend me thine ears, for I am LISTENING.", ephemeral=True)
 
         vc = await self._join_channel(interaction)
@@ -444,35 +470,38 @@ class Listen_Commands(commands.Cog):
         self.voice_client = vc
         self._text_channel = interaction.channel
 
-        # # 3. Synthesise via Wyoming Piper
-        # wav_out = await wyoming_tts(
-        #     "Lend me thine ears, for I am LISTENING.",
-        #     host=PIPER_HOST,
-        #     port=PIPER_PORT,
-        #     voice=PIPER_VOICE,
-        # )
-
-        # source = wav_to_discord_audio_source(wav_out)
-
-        # # 4. Play back; clean up after playback completes.
-        # if not (vc and vc.is_connected()):
-        #     logging.warning("[listen_cmd] Voice client gone before playback, dropping reply.")
-        #     return
-
-        # while vc.is_playing():
-        #     await asyncio.sleep(0.1)
-
-        # vc.play(source)
+        target_id = target.id if target else None
 
         # warmup_s discards audio for the first 0.5s after the sink is attached,
         # catching any residual frames the sleep above didn't cover.
-        self.sink = ConversationSink(self.bot.loop, self._handle_audio, warmup_s=0.5)
+        self.sink = ConversationSink(
+            self.bot.loop,
+            self._handle_audio,
+            warmup_s=0.5,
+            target_user_id=target_id,
+        )
         vc.listen(self.sink)
 
+        target_note = f" (listening only to **{target.display_name}**)" if target else ""
         await interaction.channel.send(
-            f"👂 Christotron is now listening in **{vc.channel.name}**. "
-            f"Speak thy peace — model: `{OLLAMA_MODEL}`."
+            f"👂 Christotron is now listening in **{vc.channel.name}**{target_note}. "
+            f"Speak thy piece — model: `{OLLAMA_MODEL}`."
         )
+
+        if announce:
+            announcement = (
+                f"I am listening{f', {target.display_name}' if target else ''}. Speak."
+            )
+            try:
+                wav_out = await wyoming_tts(
+                    announcement,
+                    host=PIPER_HOST,
+                    port=PIPER_PORT,
+                    voice=PIPER_VOICE,
+                )
+                vc.play(wav_to_discord_audio_source(wav_out))
+            except Exception as e:
+                logging.warning(f"[listen_cmd] Announce TTS failed: {e}")
 
     @app_commands.command(name="unlisten", description="Stop listening and leave the voice channel")
     async def unlisten(self, interaction: discord.Interaction) -> None:
