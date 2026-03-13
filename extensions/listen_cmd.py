@@ -319,7 +319,7 @@ class Listen_Commands(commands.Cog):
     # ------------------------------------------------------------------
 
     async def _init_dave_session(self, vc: voice_recv.VoiceRecvClient) -> None:
-        """Create a DaveSession and start the WS hook task."""
+        """Create a DaveSession and patch the voice_recv gateway hook to intercept DAVE opcodes."""
         try:
             from davey import DaveSession, DAVE_PROTOCOL_VERSION
         except ImportError:
@@ -340,121 +340,179 @@ class Listen_Commands(commands.Cog):
             if self.sink is not None:
                 self.sink.set_dave_session(session)
 
-            # Launch a task that polls the raw voice WS for DAVE opcodes
+            # --- Monkey-patch gateway.hook to intercept DAVE opcodes ---
+            #
+            # voice_recv's hook() is called by discord.py's DiscordVoiceWebSocket
+            # for every inbound WS message.  We wrap it so that DAVE opcodes
+            # (21-31) are also forwarded into a per-vc asyncio.Queue that our
+            # _dave_ws_loop consumes.  The original hook still runs, so voice_recv
+            # continues to function normally.
+            #
+            # We stash the queue on the vc object so _dave_ws_loop can find it,
+            # and stash the orignal hook so _teardown_dave_session can restore it.
+
+            import discord.ext.voice_recv.gateway as _gw
+
+            dave_queue: asyncio.Queue = asyncio.Queue()
+            vc._dave_queue = dave_queue  # type: ignore[attr-defined]
+
+            _original_hook = _gw.hook
+
+            async def _patched_hook(self_ws, msg):
+                await _original_hook(self_ws, msg)
+                op = msg.get('op', -1)
+                if 21 <= op <= 31:
+                    dave_queue.put_nowait(msg)
+
+            _gw.hook = _patched_hook
+            vc._dave_original_hook = _original_hook  # type: ignore[attr-defined]
+            logging.info("[listen_cmd] gateway.hook patched for DAVE opcode interception.")
+
+            # Also patch the already-instantiated VoiceConnectionState's ws hook,
+            # because voice_recv passes `hook=hook` by reference at connect time —
+            # the connection state captures it as a bound coroutine. We need to
+            # update the live reference on the ws object itself.
+            ws = getattr(getattr(vc, '_connection', None), 'ws', None)
+            if ws is not None and hasattr(ws, '_hook'):
+                async def _live_patched_hook(msg):
+                    await _original_hook.__func__(ws, msg) if hasattr(_original_hook, '__func__') else await _original_hook(ws, msg)
+                    op = msg.get('op', -1)
+                    if 21 <= op <= 31:
+                        dave_queue.put_nowait(msg)
+                ws._hook = _live_patched_hook
+                logging.info("[listen_cmd] Live ws._hook also patched.")
+
             self._dave_ws_task = asyncio.ensure_future(
                 self._dave_ws_loop(vc, session)
             )
             logging.info("[listen_cmd] DAVE session created, WS loop started.")
         except Exception as e:
-            logging.error(f"[listen_cmd] Failed to create DAVE session: {e}")
+            logging.error(f"[listen_cmd] Failed to create DAVE session: {e}", exc_info=True)
+
 
     async def _dave_ws_loop(self, vc: voice_recv.VoiceRecvClient, session) -> None:
         """
-        Poll the voice WebSocket for DAVE MLS opcodes and drive the handshake.
-        voice_recv exposes the underlying DiscordVoiceWebSocket via vc.ws.
+        Consume DAVE opcodes forwarded into vc._dave_queue by the patched gateway hook.
+
+        Replies are sent via vc._connection.ws.send_as_json(), which is the
+        correct path — it serialises and writes to the underlying websocket
+        without competing with discord.py's internal recv loop.
         """
-        from davey import MediaType, ProposalsOperationType
+        import base64
+        import json
+        from davey import ProposalsOperationType
 
-        # DAVE opcode constants
-        OP_PREPARE_TRANSITION  = 21
-        OP_EXECUTE_TRANSITION  = 22
-        OP_PREPARE_EPOCH       = 24
-        OP_EXTERNAL_SENDER     = 25
-        OP_PROPOSALS           = 27
-        OP_COMMIT_WELCOME      = 28
-        OP_ANNOUNCE_COMMIT     = 29
-        OP_WELCOME             = 30
+        DAVE_OPCODES = {
+            21: "PREPARE_TRANSITION",
+            22: "EXECUTE_TRANSITION",
+            24: "PREPARE_EPOCH",
+            25: "EXTERNAL_SENDER",
+            27: "PROPOSALS",
+            28: "COMMIT_WELCOME",
+            29: "ANNOUNCE_COMMIT",
+            30: "WELCOME",
+            31: "INVALID_COMMIT_WELCOME",
+        }
 
-        ws = getattr(vc, 'ws', None)
-        if ws is None:
-            logging.warning("[listen_cmd] No voice WS found on VoiceRecvClient, DAVE disabled.")
+        OP_EXECUTE_TRANSITION = 22
+        OP_COMMIT_WELCOME     = 28
+
+        queue: asyncio.Queue = getattr(vc, '_dave_queue', None)
+        if queue is None:
+            logging.error("[listen_cmd] No _dave_queue on vc — aborting DAVE WS loop.")
             return
+
+        # Helper: send a dict as JSON through the live voice websocket.
+        async def _send(payload: dict) -> None:
+            ws = getattr(getattr(vc, '_connection', None), 'ws', None)
+            if ws is None:
+                logging.warning("[listen_cmd/dave] Cannot send — ws is None.")
+                return
+            # send_as_json is discord.py's standard method on DiscordVoiceWebSocket
+            await ws.send_as_json(payload)
 
         logging.info("[listen_cmd] DAVE WS loop running.")
         try:
             while vc.is_connected() and self._dave_session is session:
                 try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    msg = await asyncio.wait_for(queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
-                except Exception as e:
-                    logging.debug(f"[listen_cmd/dave] WS recv error: {e}")
-                    break
 
-                import json
-                try:
-                    payload = json.loads(msg) if isinstance(msg, str) else msg
-                except Exception:
-                    continue
+                op: int = msg.get('op', -1)
+                data: dict = msg.get('d') or {}
+                op_name = DAVE_OPCODES.get(op, f"op{op}")
+                logging.info(f"[listen_cmd/dave] Received {op_name} (op{op})")
 
-                op = payload.get('op')
-                data = payload.get('d') or {}
-
-                if op == OP_PREPARE_TRANSITION:
-                    # Server is starting a DAVE transition — send our key package
-                    logging.info("[listen_cmd/dave] op21 PREPARE_TRANSITION received")
+                # ---- op21: server wants to start a DAVE transition ----
+                if op == 21:
                     key_pkg = session.get_serialized_key_package()
-                    import base64
-                    await ws.send(json.dumps({
+                    await _send({
                         'op': OP_EXECUTE_TRANSITION,
                         'd': {'key_package': base64.b64encode(key_pkg).decode()}
-                    }))
-                    logging.info("[listen_cmd/dave] op22 sent key package")
+                    })
+                    logging.info("[listen_cmd/dave] op22 key package sent")
 
-                elif op == OP_EXTERNAL_SENDER:
-                    raw = data.get('external_sender') or data.get('data') or data
+                # ---- op25: external sender blob ----
+                elif op == 25:
+                    raw = data.get('external_sender') or data.get('data') or b''
                     if isinstance(raw, str):
-                        import base64
                         raw = base64.b64decode(raw)
-                    elif isinstance(raw, dict):
-                        # May be the whole payload encoded
-                        continue
+                    elif isinstance(raw, list):
+                        raw = bytes(raw)
                     session.set_external_sender(bytes(raw))
                     logging.info("[listen_cmd/dave] op25 external sender set")
 
-                elif op == OP_PROPOSALS:
+                # ---- op27: MLS proposals — we must commit ----
+                elif op == 27:
                     raw = data.get('proposals') or data.get('data') or b''
                     if isinstance(raw, str):
-                        import base64
                         raw = base64.b64decode(raw)
-                    op_type_int = data.get('operation_type', 0)
-                    op_type = ProposalsOperationType(op_type_int)
+                    elif isinstance(raw, list):
+                        raw = bytes(raw)
+                    op_type = ProposalsOperationType(data.get('operation_type', 0))
                     result = session.process_proposals(op_type, bytes(raw))
                     logging.info(f"[listen_cmd/dave] op27 proposals processed (op_type={op_type})")
                     if result is not None:
-                        # Send commit (and optional welcome) back
-                        import base64
-                        commit_b64 = base64.b64encode(result.commit).decode()
-                        welcome_b64 = base64.b64encode(result.welcome).decode() if result.welcome else None
-                        payload_out = {'commit': commit_b64}
-                        if welcome_b64:
-                            payload_out['welcome'] = welcome_b64
-                        await ws.send(json.dumps({'op': OP_COMMIT_WELCOME, 'd': payload_out}))
+                        out: dict = {'commit': base64.b64encode(result.commit).decode()}
+                        if result.welcome:
+                            out['welcome'] = base64.b64encode(result.welcome).decode()
+                        await _send({'op': OP_COMMIT_WELCOME, 'd': out})
                         logging.info("[listen_cmd/dave] op28 commit/welcome sent")
 
-                elif op == OP_WELCOME:
-                    raw = data.get('welcome') or data.get('data') or b''
-                    if isinstance(raw, str):
-                        import base64
-                        raw = base64.b64decode(raw)
-                    session.process_welcome(bytes(raw))
-                    logging.info(f"[listen_cmd/dave] op30 welcome processed, ready={session.ready}")
-
-                elif op == OP_ANNOUNCE_COMMIT:
+                # ---- op29: server's announce-commit ----
+                elif op == 29:
                     raw = data.get('commit') or data.get('data') or b''
                     if isinstance(raw, str):
-                        import base64
                         raw = base64.b64decode(raw)
+                    elif isinstance(raw, list):
+                        raw = bytes(raw)
                     session.process_commit(bytes(raw))
                     logging.info(f"[listen_cmd/dave] op29 commit processed, ready={session.ready}")
 
-                elif op == OP_PREPARE_EPOCH:
-                    logging.info("[listen_cmd/dave] op24 PREPARE_EPOCH received")
+                # ---- op30: welcome (bot joined an existing group) ----
+                elif op == 30:
+                    raw = data.get('welcome') or data.get('data') or b''
+                    if isinstance(raw, str):
+                        raw = base64.b64decode(raw)
+                    elif isinstance(raw, list):
+                        raw = bytes(raw)
+                    session.process_welcome(bytes(raw))
+                    logging.info(f"[listen_cmd/dave] op30 welcome processed, ready={session.ready}")
+
+                # ---- op24: epoch ready (informational) ----
+                elif op == 24:
+                    logging.info("[listen_cmd/dave] op24 PREPARE_EPOCH — session epoch advancing")
+
+                # ---- op31: bad commit/welcome, session is broken ----
+                elif op == 31:
+                    logging.error("[listen_cmd/dave] op31 INVALID_COMMIT_WELCOME — DAVE session broken")
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logging.error(f"[listen_cmd/dave] WS loop error: {e}", exc_info=True)
+
         logging.info("[listen_cmd] DAVE WS loop exited.")
 
     async def _teardown_dave_session(self) -> None:
@@ -465,6 +523,16 @@ class Listen_Commands(commands.Cog):
             except asyncio.CancelledError:
                 pass
             self._dave_ws_task = None
+
+        # Restore the original gateway hook
+        if self.voice_client is not None:
+            original = getattr(self.voice_client, '_dave_original_hook', None)
+            if original is not None:
+                import discord.ext.voice_recv.gateway as _gw
+                _gw.hook = original
+                del self.voice_client._dave_original_hook
+                logging.info("[listen_cmd] gateway.hook restored.")
+
         self._dave_session = None
 
     # ------------------------------------------------------------------
